@@ -172,7 +172,28 @@ class Moench(PyMMCoreMicroscope):
 
     def post_experiment(self):
         """Post-process the experiment."""
-        self.wakeup_dmd.run()
+        pass
+
+    def shutdown(self):
+        """Tear down hardware state so the microscope can be discarded.
+
+        Stops the DMD wakeup loop and unloads all Micro-Manager devices
+        so COM ports (notably the LED on COM3) and the SLM handle are
+        released. Without this, pymmcore's native threads keep the
+        Python process alive after the main thread exits, leaving a
+        zombie that blocks the next session with
+        ``Error in device "COM3"`` when MM tries to initialize.
+        """
+        wakeup = getattr(self, "wakeup_dmd", None)
+        if wakeup is not None:
+            try:
+                wakeup.stop()
+            except Exception:
+                pass
+        try:
+            self.mmc.unloadAllDevices()
+        except Exception:
+            pass
 
     def shutdown(self):
         """Tear down hardware state so the microscope can be discarded.

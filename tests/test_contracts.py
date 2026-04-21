@@ -184,9 +184,7 @@ class TestTrackingContract:
 
     @pytest.fixture
     def fov(self):
-        fov = FovState()
-        _ = fov.tracks_queue.get()  # drain the initial empty df
-        return fov
+        return FovState()
 
     def test_first_frame_returns_valid_df(self, tracker, fov):
         df_new = _detections([(40, 40), (90, 90)])

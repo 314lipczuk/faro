@@ -488,6 +488,24 @@ class Analyzer:
         if self.writer is not None:
             self.writer.close()
 
+    def wait_idle(self, timeout: float = 30.0, poll: float = 0.05) -> bool:
+        """Block until storage, pipeline, and deferred queues all drain.
+
+        Returns True if idle was reached before the timeout, False
+        otherwise. Used by tests and smoke scripts to flush in-flight
+        work before asserting on outputs, without a full ``shutdown``.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            storage_empty = self._storage_queue.qsize() == 0
+            deferred_empty = self._deferred_queue.qsize() == 0
+            with self.task_lock:
+                pipeline_idle = self.active_pipeline_tasks == 0
+            if storage_empty and deferred_empty and pipeline_idle:
+                return True
+            time.sleep(poll)
+        return False
+
     def get_stats(self) -> dict:
         """Get analyzer statistics."""
         with self.task_lock:

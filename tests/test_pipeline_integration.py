@@ -1434,8 +1434,6 @@ class _TinyScene:
     image_height = 16
     image_width = 16
     channels = ("phase-contrast",)
-    slm_name = None
-    slm_shape = None
 
     def render(self, event: MDAEvent) -> np.ndarray:
         return _make_tiny_image()

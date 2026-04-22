@@ -7,78 +7,13 @@ exposure / device-property values are within the hardware's reported limits.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterable, Mapping
-from typing import Optional
 
-import numpy as np
 import pytest
 
 from faro.core.data_structures import Channel, PowerChannel, RTMEvent
 from faro.core.utils import validate_hardware
 
-from tests.fake_mmc import build_core
-
-
-class _ValidationScene:
-    """Minimal scene for validation tests; ``render`` never fires."""
-
-    image_height = 64
-    image_width = 64
-    slm_name = None
-    slm_shape = None
-
-    def __init__(self, channels: Iterable[str]):
-        self.channels = tuple(channels)
-
-    def render(self, event):
-        return np.zeros((self.image_height, self.image_width), dtype=np.uint16)
-
-
-def _core(
-    *,
-    config_groups: Optional[Mapping[str, Iterable[str]]] = None,
-    property_limits: Optional[Mapping[tuple[str, str], tuple[float, float]]] = None,
-    devices: Optional[Mapping[str, Iterable[str]]] = None,
-    config_data: Optional[Mapping[tuple[str, str], Iterable[tuple[str, str, str]]]] = None,
-    channel_group: str = "",
-):
-    """Build a UniMMCore with the validation-relevant surface populated.
-
-    Mirrors the old hand-rolled ``FakeMMCore`` kwargs so each test reads
-    the same. Under the hood it wires a real ``UniMMCore`` via
-    :func:`tests.fake_mmc.build_core` with property holders for any
-    light-source devices the test needs.
-    """
-    groups = dict(config_groups) if config_groups else {
-        "Channel": ["phase-contrast", "DAPI", "membrane"],
-    }
-    main_group = next(iter(groups), "Channel")
-    main_channels = list(groups.get(main_group, []))
-    extras = {g: list(cfgs) for g, cfgs in groups.items() if g != main_group}
-
-    camera_limits = None
-    extra_devices: dict[str, dict[str, tuple[float, float] | None]] = {}
-    if devices:
-        for dev, props in devices.items():
-            if dev == "Camera":
-                continue  # FakeCamera already registers its standard properties
-            extra_devices.setdefault(dev, {}).update({p: None for p in props})
-    if property_limits:
-        for (dev, prop), lims in property_limits.items():
-            if dev == "Camera" and prop == "Exposure":
-                camera_limits = lims
-            else:
-                extra_devices.setdefault(dev, {})[prop] = lims
-
-    scene = _ValidationScene(main_channels)
-    return build_core(
-        scene,
-        camera_exposure_limits=camera_limits,
-        extra_devices=extra_devices or None,
-        config_data=config_data,
-        extra_configs=extras or None,
-        channel_group=channel_group,
-    )
+from tests.fake_mmc import build_validation_core as _core
 
 
 def _make_events(*, channels=None, stim_channels=None, n=3):

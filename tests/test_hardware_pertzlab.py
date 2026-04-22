@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from faro.core.utils import detect_power_properties
-from tests.test_validate_hardware import _core
+from tests.fake_mmc import build_validation_core as _core
 
 
 # ===================================================================

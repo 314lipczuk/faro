@@ -29,11 +29,15 @@ Usage::
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Optional, Protocol, Tuple, runtime_checkable
 
 import numpy as np
-from pymmcore_plus.experimental.unicore import CameraDevice, UniMMCore
+from pymmcore_plus.experimental.unicore import (
+    CameraDevice,
+    GenericDevice,
+    UniMMCore,
+)
 from pymmcore_plus.experimental.unicore.devices._slm import SLMDevice
 from useq import MDAEvent
 
@@ -168,19 +172,83 @@ class FakeSLM(SLMDevice):
             on_slm(self._buf, self._bridge.current_event)
 
 
-def build_core(scene: Scene) -> UniMMCore:
+class _PropertyHolder(GenericDevice):
+    """Minimal device that registers arbitrary named properties.
+
+    Used by :func:`build_core` for stubbing devices that
+    ``validate_hardware`` needs to see (light sources like ``Spectra``
+    with ``*_Level`` properties, etc.). Each property is either a bare
+    stringish slot or a float slot with ``(lo, hi)`` limits.
+    """
+
+    def __init__(self, name: str, properties: Mapping[str, Optional[Tuple[float, float]]]) -> None:
+        super().__init__()
+        self._name = name
+        self._values: dict[str, object] = {}
+        for prop, limits in properties.items():
+            default = 0.0 if limits is not None else ""
+            self._values[prop] = default
+            self.register_property(
+                prop,
+                getter=lambda self, _p=prop: self._values[_p],
+                setter=lambda self, v, _p=prop: self._values.__setitem__(_p, v),
+                limits=limits,
+            )
+
+    def name(self) -> str:
+        return self._name
+
+    def description(self) -> str:
+        return f"Fake device: {self._name}"
+
+
+def build_core(
+    scene: Scene,
+    *,
+    camera_exposure_limits: Optional[Tuple[float, float]] = None,
+    extra_devices: Optional[Mapping[str, Mapping[str, Optional[Tuple[float, float]]]]] = None,
+    config_data: Optional[Mapping[Tuple[str, str], Iterable[Tuple[str, str, str]]]] = None,
+    extra_configs: Optional[Mapping[str, Iterable[str]]] = None,
+    channel_group: Optional[str] = None,
+) -> UniMMCore:
     """Build a ``UniMMCore`` wired with :class:`FakeCamera` (and SLM).
 
-    Returns a core ready to drive MDA events via ``core.run_mda(events)``.
-    Defines a channel config for each name in ``scene.channels``
-    (defaulting to ``["phase-contrast"]``) so pymmcore's resolve path
-    can look them up. Auto-shutter is disabled since no shutter device
-    is loaded.
+    Acquisition tests pass a ``Scene`` and nothing else; the returned
+    core drives MDA events via ``core.run_mda(events)``. Validation
+    tests (``validate_hardware``) pass the extra kwargs to register
+    property limits, additional light-source devices, and per-config
+    property settings so ``detect_power_properties`` and exposure/power
+    range checks find what they expect.
+
+    Args:
+        scene: image source + hardware shape declaration.
+        camera_exposure_limits: ``(lo, hi)`` to apply to the camera's
+            ``Exposure`` property. ``hasPropertyLimits("Camera", "Exposure")``
+            will return True and the getters will return these bounds.
+        extra_devices: ``{device_name: {property_name: (lo, hi) or None}}``.
+            Loads a :class:`_PropertyHolder` per entry so ``validate_hardware``
+            sees the device in ``getLoadedDevices()`` with those properties.
+        config_data: ``{(group, config_name): [(device, property, value)]}``.
+            Defines each config with its settings so ``getConfigData`` walks
+            through them. Use this to set up channel configs that reference
+            a light source's ``Label`` property (needed for
+            ``detect_power_properties`` to match colors).
+        extra_configs: ``{group: [config_name, ...]}``. Adds configs
+            that appear under ``getAvailableConfigs`` without custom
+            settings (each gets a dummy ``Camera.Exposure`` setting).
+            Used when a test's config lookup crosses multiple groups.
+        channel_group: override ``scene.channel_group`` /
+            :data:`DEFAULT_CHANNEL_GROUP`. Passing ``""`` leaves the
+            core's channel group unset (some validation tests rely on
+            ``getChannelGroup() == ""`` triggering a full config-group
+            scan).
     """
     bridge = _Bridge()
     core = UniMMCore()
 
     camera = FakeCamera(scene, bridge)
+    if camera_exposure_limits is not None:
+        camera.set_property_limits("Exposure", camera_exposure_limits)
     core.loadPyDevice(CAMERA_LABEL, camera)
     core.initializeDevice(CAMERA_LABEL)
     core.setCameraDevice(CAMERA_LABEL)
@@ -193,11 +261,50 @@ def build_core(scene: Scene) -> UniMMCore:
         core.initializeDevice(slm_name)
         core.setSLMDevice(slm_name)
 
-    group = getattr(scene, "channel_group", DEFAULT_CHANNEL_GROUP)
+    # Auto-register any device.property referenced in config_data settings
+    # that isn't already in extra_devices. pymmcore's defineConfig requires
+    # the device+property to exist; tests shouldn't have to spell it twice.
+    merged_devices: dict[str, dict[str, Optional[Tuple[float, float]]]] = {
+        d: dict(p) for d, p in (extra_devices or {}).items()
+    }
+    if config_data:
+        for settings in config_data.values():
+            for dev, prop, _value in settings:
+                if dev == CAMERA_LABEL:
+                    continue
+                merged_devices.setdefault(dev, {}).setdefault(prop, None)
+
+    for dev_name, props in merged_devices.items():
+        holder = _PropertyHolder(dev_name, props)
+        core.loadPyDevice(dev_name, holder)
+        core.initializeDevice(dev_name)
+
+    configured: set[tuple[str, str]] = set()
+    if config_data:
+        for (group, config_name), settings in config_data.items():
+            for device, prop, value in settings:
+                core.defineConfig(group, config_name, device, prop, value)
+            configured.add((group, config_name))
+
+    group = (
+        channel_group
+        if channel_group is not None
+        else getattr(scene, "channel_group", DEFAULT_CHANNEL_GROUP)
+    )
+    default_group = group or DEFAULT_CHANNEL_GROUP
     channels = getattr(scene, "channels", ("phase-contrast",))
     for name in channels:
-        core.defineConfig(group, name, CAMERA_LABEL, "Exposure", "10")
-    core.setChannelGroup(group)
+        if (default_group, name) not in configured:
+            core.defineConfig(default_group, name, CAMERA_LABEL, "Exposure", "10")
+
+    if extra_configs:
+        for g, names in extra_configs.items():
+            for n in names:
+                if (g, n) not in configured:
+                    core.defineConfig(g, n, CAMERA_LABEL, "Exposure", "10")
+
+    if group:
+        core.setChannelGroup(group)
 
     core.mda.events.eventStarted.connect(bridge._on_event_started)
     return core

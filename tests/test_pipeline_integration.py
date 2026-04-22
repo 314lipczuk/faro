@@ -35,31 +35,25 @@ from faro.feature_extraction.simple import SimpleFE
 from faro.segmentation.base import OtsuSegmentator
 from faro.stimulation.base import Stim, StimWithImage, StimWithPipeline, StimWholeFOV
 from faro.stimulation.center_circle import CenterCircle
-from faro.tracking.motile_tracker import TrackerMotile
 from faro.tracking.trackpy import TrackerTrackpy
 
 from tests.fake_microscope import FakeMicroscope
-
-
-@pytest.fixture(
-    params=[
-        pytest.param(TrackerTrackpy, id="Trackpy"),
-        pytest.param(TrackerMotile, id="Motile"),
-    ],
+from tests.fixtures import (
+    CIRCLE1_CENTER,
+    CIRCLE1_RADIUS,
+    CIRCLE2_CENTER,
+    CIRCLE2_RADIUS,
+    IMG_SIZE,
+    CircleScene,
+    assert_no_background_errors,
+    make_circle_image,
+    make_events,
+    run_and_wait,
+    run_and_wait_long,
+    tracker,  # noqa: F401 — parametrized fixture, auto-discovered by pytest
 )
-def tracker(request):
-    """Per-test tracker instance; parametrizes pipeline tests across both."""
-    return request.param(search_range=50, memory=3)
+from tests.fixtures import make_pipeline as _make_pipeline
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-IMG_SIZE = 256
-CIRCLE1_CENTER = (64, 64)  # (row, col)
-CIRCLE1_RADIUS = 20
-CIRCLE2_CENTER = (192, 192)
-CIRCLE2_RADIUS = 15
 
 EXPECTED_AREA_1 = math.pi * CIRCLE1_RADIUS**2  # ~1257
 EXPECTED_AREA_2 = math.pi * CIRCLE2_RADIUS**2  # ~707
@@ -67,120 +61,6 @@ EXPECTED_AREA_2 = math.pi * CIRCLE2_RADIUS**2  # ~707
 N_TIMEPOINTS = 5
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def make_circle_image() -> np.ndarray:
-    """Generate a 256x256 uint16 image with two bright circles."""
-    img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint16)
-    y, x = np.ogrid[:IMG_SIZE, :IMG_SIZE]
-
-    mask1 = (y - CIRCLE1_CENTER[0]) ** 2 + (
-        x - CIRCLE1_CENTER[1]
-    ) ** 2 <= CIRCLE1_RADIUS**2
-    mask2 = (y - CIRCLE2_CENTER[0]) ** 2 + (
-        x - CIRCLE2_CENTER[1]
-    ) ** 2 <= CIRCLE2_RADIUS**2
-
-    img[mask1] = 50000
-    img[mask2] = 50000
-    return img
-
-
-def make_events(n_timepoints: int, *, stim_frames=()) -> list[RTMEvent]:
-    """Create a list of RTMEvents for testing."""
-    stim_set = set(stim_frames)
-    stim_ch = (Channel(config="stim-405", exposure=100),)
-    events = []
-    for t in range(n_timepoints):
-        has_stim = t in stim_set
-        events.append(
-            RTMEvent(
-                index={"t": t, "p": 0},
-                channels=(Channel(config="phase-contrast", exposure=50),),
-                stim_channels=stim_ch if has_stim else (),
-                metadata={},
-            )
-        )
-    return events
-
-
-# ---------------------------------------------------------------------------
-# Scenes driving FakeMicroscope
-# ---------------------------------------------------------------------------
-
-
-class CircleScene:
-    """Scene plugin for :class:`FakeMicroscope`: two bright circles.
-
-    Renders the same 2-circle image every frame, except for timepoints
-    listed in ``blank_frames`` which come back all-zero (for testing
-    no-cell edge cases).
-
-    When ``with_slm=True`` the scene declares an SLM so the Controller
-    stim branch runs. Dispatched masks are recorded as
-    ``(frame_idx, mask_ndarray)`` in :attr:`slm_events`. The ndarray is
-    what the mmc would send to hardware, regardless of whether the
-    originating ``SLMImage.data`` was a bool sentinel or an ndarray.
-    """
-
-    image_height = IMG_SIZE
-    image_width = IMG_SIZE
-    channels = ("phase-contrast", "stim-405")
-
-    def __init__(self, *, blank_frames: set[int] = frozenset(), with_slm: bool = False):
-        self.blank_frames = set(blank_frames)
-        self.slm_events: list[tuple[int, np.ndarray]] = []
-        self.slm_name = "SLM" if with_slm else None
-        self.slm_shape = (IMG_SIZE, IMG_SIZE) if with_slm else None
-
-    def render(self, event: MDAEvent) -> np.ndarray:
-        t = event.index.get("t", 0)
-        if t in self.blank_frames:
-            return np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint16)
-        return make_circle_image()
-
-    def on_slm_displayed(self, image: np.ndarray, event: MDAEvent) -> None:
-        self.slm_events.append((event.index.get("t", 0), image))
-
-
-# ---------------------------------------------------------------------------
-# run_and_wait helper
-# ---------------------------------------------------------------------------
-
-
-def assert_no_background_errors(ctrl: Controller) -> None:
-    """Fail with a readable message if any background errors were recorded."""
-    if ctrl.background_errors:
-        summary = "\n".join(
-            f"  [{e.source}] {e.exc_type}: {e.message}" for e in ctrl.background_errors
-        )
-        raise AssertionError(f"Background errors during acquisition:\n{summary}")
-
-
-def run_and_wait(ctrl: Controller, events: list[RTMEvent], stim_mode: str = "current"):
-    """Run an experiment and block until all pipeline work finishes."""
-    ctrl.run_experiment(events, stim_mode=stim_mode, validate=False)
-    ctrl._analyzer.wait_idle()
-    ctrl._analyzer.shutdown(wait=True)
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-def _make_pipeline(path, *, tracker, with_stim=False):
-    """Build a pipeline with real components for integration testing."""
-    return ImageProcessingPipeline(
-        storage_path=path,
-        segmentators=[SegmentationMethod("labels", OtsuSegmentator(), 0, False)],
-        tracker=tracker,
-        feature_extractor=SimpleFE("labels"),
-        stimulator=CenterCircle() if with_stim else None,
-    )
 
 
 # ===================================================================
@@ -951,18 +831,6 @@ class SlowSegmentator(OtsuSegmentator):
     def segment(self, image: np.ndarray) -> np.ndarray:
         time.sleep(self._delay)
         return super().segment(image)
-
-
-def run_and_wait_long(
-    ctrl: Controller,
-    events: list[RTMEvent],
-    stim_mode: str = "current",
-    timeout: float = 120,
-):
-    """Like run_and_wait but with a longer timeout for slow pipelines."""
-    ctrl.run_experiment(events, stim_mode=stim_mode, validate=False)
-    ctrl._analyzer.wait_idle(timeout=timeout)
-    ctrl._analyzer.shutdown(wait=True)
 
 
 # ===================================================================

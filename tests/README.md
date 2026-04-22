@@ -61,6 +61,23 @@ class TestSegmentationContract:
         return request.param
 ```
 
+### Tracker-specific output columns
+
+Trackers may add columns beyond the required `particle / x / y / label`
+(e.g. `TrackerMotile` adds `parent_particle` for lineage). The pipeline
+concats each frame's output and saves to parquet, so extra columns
+just propagate. To test that your tracker's extra column behaves:
+
+```python
+def test_my_tracker_adds_cost_column(tmp_dir):
+    df = _run(tmp_dir, MyTracker())
+    assert "cost" in df.columns
+    assert (df["cost"] >= 0).all()
+```
+
+Contract tests check the *required* columns only (subset match), so
+extra columns do not need to be declared in any base class.
+
 ### Integration test for a new stimulator
 
 Use `FakeMicroscope` + `CircleScene(with_slm=True)`:

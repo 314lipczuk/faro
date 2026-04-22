@@ -33,6 +33,14 @@ class TrackerMotile(Tracker):
     FOVs the unique identifier is the ``(fov, particle)`` pair, matching
     :class:`~faro.tracking.trackpy.TrackerTrackpy`.
 
+    **Lineage column**: when the solver picks a 1-to-N split, each child
+    row carries a ``parent_particle`` column pointing back to the
+    dividing tip's particle ID. Non-division rows (continuations, new
+    appearances, pre-division frames) hold ``<NA>``. The column has
+    nullable-``Int64`` dtype and is present in every Motile run; it is
+    absent from ``TrackerTrackpy`` output since Trackpy does not model
+    lineage.
+
     Subclass and override :meth:`compute_custom_costs` to modulate per-tip
     costs based on track history — e.g. reward divisions when a cell-cycle
     marker is rising, or cheapen track loss when a death marker is high.
@@ -136,12 +144,14 @@ class TrackerMotile(Tracker):
         if df_old.empty:
             df_new["particle"] = _alloc_ids(fov_state, n_det)
             df_new["fov_timestep"] = current_t
+            df_new["parent_particle"] = _empty_parent_column(n_det)
             return df_new.reset_index(drop=True)
 
         tips = _get_active_tips(df_old, current_t, self.memory)
         if tips.empty:
             df_new["particle"] = _alloc_ids(fov_state, n_det)
             df_new["fov_timestep"] = current_t
+            df_new["parent_particle"] = _empty_parent_column(n_det)
             return pd.concat([df_old, df_new], ignore_index=True)
 
         n_tips = len(tips)
@@ -219,22 +229,36 @@ class TrackerMotile(Tracker):
                 assignments.setdefault(tip_idx, []).append(det_node - det_offset)
 
         particle_ids = np.full(n_det, -1, dtype=np.int64)
+        parent_ids = np.full(n_det, -1, dtype=np.int64)  # -1 = no parent
         for tip_idx, det_indices in assignments.items():
             if len(det_indices) == 1:
                 particle_ids[det_indices[0]] = int(tip_particles[tip_idx])
             else:
+                # Division: both children get fresh IDs but keep a breadcrumb
+                # back to the parent tip so downstream lineage analysis works.
                 new_ids = _alloc_ids(fov_state, len(det_indices))
+                parent = int(tip_particles[tip_idx])
                 for det_idx, pid in zip(det_indices, new_ids):
                     particle_ids[det_idx] = pid
+                    parent_ids[det_idx] = parent
 
         unmatched = particle_ids < 0
         if unmatched.any():
             particle_ids[unmatched] = _alloc_ids(fov_state, int(unmatched.sum()))
 
         df_new["particle"] = particle_ids.astype(np.uint32)
+        df_new["parent_particle"] = pd.array(
+            [pd.NA if p < 0 else p for p in parent_ids],
+            dtype="Int64",
+        )
         df_new["fov_timestep"] = current_t
 
         return pd.concat([df_old, df_new], ignore_index=True)
+
+
+def _empty_parent_column(n: int) -> pd.api.extensions.ExtensionArray:
+    """All-NA nullable Int64 column of length ``n``."""
+    return pd.array([pd.NA] * n, dtype="Int64")
 
 
 def _alloc_ids(fov_state, n):

@@ -1,18 +1,18 @@
 """Tracking behavior around cell divisions.
 
-One cell at t=0-2 splits into two daughters at t=3 and both daughters
-continue through t=5. Runs the full pipeline for both Trackpy and
-Motile, and verifies tracker-agnostic invariants:
+Two layers of test:
 
-* Both daughters are tracked in every post-division frame.
-* Each daughter has a single particle ID across post-division frames.
-* Pre-division frames see exactly one particle; post-division frames
-  see exactly two.
+1. **Tracker-agnostic**: after a 1-to-2 cell split, both daughters are
+   tracked through the rest of the run with persistent particle IDs.
+   Runs against both Trackpy and Motile.
 
-Motile models divisions natively (both daughters get freshly-allocated
-IDs distinct from the parent); Trackpy's subnet linking assigns a new
-ID to one daughter and keeps the parent's ID on the other. The test
-accepts either behavior.
+2. **Motile-specific lineage**: when Motile's solver decides a detection
+   pair is a division, each child's row carries a ``parent_particle``
+   column pointing back to the dividing tip. Trackpy produces no such
+   column (trackers can add their own columns without base-class
+   changes). Division handling in Motile is tuned with a strongly
+   negative ``split_cost`` so the ILP actually picks the split over
+   an appear event for the test scene.
 """
 
 from __future__ import annotations
@@ -94,18 +94,6 @@ def _make_events(n_frames: int) -> list[RTMEvent]:
     ]
 
 
-@pytest.fixture(
-    params=[
-        pytest.param(TrackerTrackpy, id="Trackpy"),
-        pytest.param(TrackerMotile, id="Motile"),
-    ],
-)
-def tracker(request):
-    # Generous search_range (> daughter drift per frame) and a memory
-    # window so neither tracker hard-rejects the new detections.
-    return request.param(search_range=30, memory=3)
-
-
 def _run(tmp_dir: str, tracker) -> pd.DataFrame:
     pipeline = ImageProcessingPipeline(
         storage_path=tmp_dir,
@@ -124,18 +112,32 @@ def _run(tmp_dir: str, tracker) -> pd.DataFrame:
     return pd.read_parquet(os.path.join(tmp_dir, "tracks", "0_latest.parquet"))
 
 
+# ===========================================================================
+# Tracker-agnostic: two daughters survive the split
+# ===========================================================================
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(TrackerTrackpy, id="Trackpy"),
+        pytest.param(TrackerMotile, id="Motile"),
+    ],
+)
+def tracker(request):
+    # Generous search_range (> daughter drift per frame) and a memory
+    # window so neither tracker hard-rejects the new detections.
+    return request.param(search_range=30, memory=3)
+
+
 def test_division_produces_two_tracked_daughters(tmp_dir, tracker):
     df = _run(tmp_dir, tracker)
 
-    # Pre-division: exactly one particle per frame.
     for t in range(DIVISION_FRAME):
         frame = df[df["timestep"] == t]
         assert len(frame) == 1, (
             f"pre-division frame t={t} has {len(frame)} detections"
         )
 
-    # Post-division: exactly two detections per frame, each tagged with
-    # a particle ID that persists for the rest of the run.
     daughter_ids_per_frame: list[set[int]] = []
     for t in range(DIVISION_FRAME, N_FRAMES):
         frame = df[df["timestep"] == t]
@@ -144,9 +146,53 @@ def test_division_produces_two_tracked_daughters(tmp_dir, tracker):
         )
         daughter_ids_per_frame.append(set(frame["particle"].tolist()))
 
-    # Each daughter's ID holds across all post-division frames.
     persistent_ids = set.intersection(*daughter_ids_per_frame)
     assert len(persistent_ids) == 2, (
         f"Expected two particle IDs persisting through all post-division "
         f"frames; got {persistent_ids}. Per-frame: {daughter_ids_per_frame}"
     )
+
+
+# ===========================================================================
+# Tracker-specific: parent_particle lineage column (Motile only)
+# ===========================================================================
+
+
+def test_trackpy_output_has_no_parent_particle_column(tmp_dir):
+    """Trackpy doesn't model lineage; the column must be absent entirely
+    (not null-filled) so downstream code can tell from schema alone."""
+    df = _run(tmp_dir, TrackerTrackpy(search_range=30, memory=3))
+    assert "parent_particle" not in df.columns
+
+
+def test_motile_records_parent_on_division(tmp_dir):
+    """With ``split_cost`` strongly negative the ILP picks the 1→2
+    division over a "one continues + one appears" assignment. Both
+    division children must have ``parent_particle`` pointing back to
+    the dividing tip; pre-division rows must be null."""
+    df = _run(tmp_dir, TrackerMotile(search_range=30, memory=3, split_cost=-100.0))
+    assert "parent_particle" in df.columns
+
+    # Pre-division: no parent info
+    pre = df[df["timestep"] < DIVISION_FRAME]
+    assert pre["parent_particle"].isna().all(), (
+        f"pre-division rows should have <NA> parent, got {pre['parent_particle'].tolist()}"
+    )
+
+    # Division frame: both daughters share a single parent ID, and
+    # that parent ID matches the particle tracked in the previous frame.
+    parent_frame = df[df["timestep"] == DIVISION_FRAME - 1]
+    assert len(parent_frame) == 1
+    parent_pid = int(parent_frame["particle"].iloc[0])
+
+    div_frame = df[df["timestep"] == DIVISION_FRAME]
+    assert len(div_frame) == 2
+    parents = div_frame["parent_particle"].tolist()
+    assert all(p == parent_pid for p in parents), (
+        f"both daughters should trace back to particle {parent_pid}, "
+        f"got parents {parents}"
+    )
+    # Children are freshly-allocated — distinct from each other and from the parent.
+    children = set(div_frame["particle"].tolist())
+    assert len(children) == 2
+    assert parent_pid not in children

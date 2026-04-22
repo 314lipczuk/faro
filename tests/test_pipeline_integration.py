@@ -128,11 +128,12 @@ class CircleScene:
 
     image_height = IMG_SIZE
     image_width = IMG_SIZE
+    channels = ("phase-contrast", "stim-405")
 
     def __init__(self, *, blank_frames: set[int] = frozenset(), with_slm: bool = False):
         self.blank_frames = set(blank_frames)
         self.slm_events: list[tuple[int, np.ndarray]] = []
-        self.slm_name = "FakeSLM" if with_slm else None
+        self.slm_name = "SLM" if with_slm else None
         self.slm_shape = (IMG_SIZE, IMG_SIZE) if with_slm else None
 
     def render(self, event: MDAEvent) -> np.ndarray:
@@ -1432,6 +1433,7 @@ class _TinyScene:
 
     image_height = 16
     image_width = 16
+    channels = ("phase-contrast",)
     slm_name = None
     slm_shape = None
 

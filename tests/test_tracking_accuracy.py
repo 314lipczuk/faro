@@ -113,6 +113,7 @@ class SyntheticCellScene:
 
     image_height = IMG_SIZE
     image_width = IMG_SIZE
+    channels = ("phase-contrast", "fitc", "stim-405")
 
     def __init__(
         self,
@@ -124,7 +125,7 @@ class SyntheticCellScene:
     ):
         self.gt = _make_gt(n_cells, n_frames, seed=seed)
         self.slm_events: list[tuple[int, np.ndarray]] = []
-        self.slm_name = "FakeSLM" if with_slm else None
+        self.slm_name = "SLM" if with_slm else None
         self.slm_shape = (IMG_SIZE, IMG_SIZE) if with_slm else None
 
     def render(self, event: MDAEvent) -> np.ndarray:

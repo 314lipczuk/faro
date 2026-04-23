@@ -61,7 +61,9 @@ pipeline tests — the segmenter always finds exactly two labels.
 `SyntheticCellScene` (`tests/test_tracking_accuracy.py`): 50 cells
 rendered as small disks with deterministic linear drift plus Brownian
 noise. Used by the tracking-accuracy suite; known per-frame ground
-truth lives on `scene.gt[t]`.
+truth lives on `scene.gt[t]`. The coloured lines are the GT
+trajectories each cell has travelled up to frame `t` — the tracker is
+expected to recover each one as a single particle ID.
 
 ![Stim mask alignment](assets/stim_mask_overlay.png)
 

@@ -47,14 +47,25 @@ def circle_scene() -> None:
 
 def synthetic_cells_strip() -> None:
     scene = SyntheticCellScene(n_cells=50, n_frames=15)
+    gt = np.stack(scene.gt, axis=0)  # (T, N, 2) of (row, col)
+    n_cells = gt.shape[1]
+    cmap = plt.get_cmap("tab20")
+
     fig, axes = plt.subplots(1, 4, figsize=(12, 3.3), dpi=150)
     for ax, t in zip(axes, [0, 5, 10, 14]):
-        img = scene.render(MDAEvent(index={"t": t, "p": 0, "c": 0}))
-        ax.imshow(img, cmap="gray")
+        ax.imshow(scene.render(MDAEvent(index={"t": t, "p": 0, "c": 0})), cmap="gray")
+        if t > 0:
+            # Draw the GT trail up to frame t for every cell, color per cell.
+            for i in range(n_cells):
+                rows = gt[: t + 1, i, 0]
+                cols = gt[: t + 1, i, 1]
+                ax.plot(cols, rows, color=cmap(i % 20), lw=0.8, alpha=0.9)
         ax.set_xticks([])
         ax.set_yticks([])
         ax.set_title(f"t={t}", fontsize=11)
-    fig.suptitle("SyntheticCellScene (50 cells, drifting)", fontsize=12)
+    fig.suptitle(
+        "SyntheticCellScene (50 cells, drifting; GT tracks overlaid)", fontsize=12
+    )
     fig.tight_layout()
     _save(fig, "scene_synthetic_cells.png")
 

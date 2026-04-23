@@ -69,9 +69,16 @@ expected to recover each one as a single particle ID.
 
 When the pipeline runs with `StimPerCellCenter` stim the scene
 captures each dispatched SLM mask in `scene.slm_events`. The mask's
-blob centroids should sit on top of the GT cell positions — the
-stim-alignment test (`test_stim_masks_centered_on_cells`) asserts that
-median offset ≤ 2 px.
+blob centroids should sit on top of the GT cell positions —
+`test_stim_masks_centered_on_cells` asserts median offset ≤ 2 px. The
+test is parametrised across `stim_mode="current"` and
+`stim_mode="previous"`; in `previous` mode the mask dispatched at
+frame `t` was built from frame `t-1`, so the test references
+`scene.gt[t-1]` instead. A separate regression guard
+(`test_previous_mode_mask_is_one_frame_behind_cells`) asserts that
+against `gt[t]` the mask *does* show roughly one frame of drift —
+catching the silent failure where `previous` mode accidentally
+received the current frame's mask.
 
 Regenerate the images with `python -m tests.assets.generate` after
 editing a scene.

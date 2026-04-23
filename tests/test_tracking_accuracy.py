@@ -317,13 +317,22 @@ def _mask_blob_centroids(mask: np.ndarray) -> np.ndarray:
     return np.array([p.centroid for p in regionprops(cc)])
 
 
-def test_stim_masks_centered_on_cells(tmp_dir):
+@pytest.mark.parametrize("stim_mode", ["current", "previous"])
+def test_stim_masks_centered_on_cells(tmp_dir, stim_mode):
     """StimPerCellCenter should drop a disk on each cell at every stim frame.
 
-    Runs the pipeline with ``stim_mode="current"`` so the mask at frame t
-    is built from frame t's segmentation. For each delivered SLM mask,
-    extracts blob centroids and matches them to the frame's GT cell
-    positions via nearest-neighbor. The alignment should be tight.
+    The mask dispatched at frame ``t`` is built from whichever frame the
+    controller picked:
+
+    * ``stim_mode="current"`` — frame ``t``'s own segmentation. Mask
+      centroids must line up with GT positions at frame ``t``.
+    * ``stim_mode="previous"`` — frame ``t-1``'s segmentation. The cells
+      drifted between ``t-1`` and ``t``, so matching against ``gt[t]``
+      would surface that drift as a spurious "offset". We therefore
+      match against ``gt[t-1]`` — the frame the mask was actually built
+      from. Under both modes the alignment is thus equally tight
+      (segmentation ↔ computed-from frame is exact up to centroid
+      rounding).
     """
     stim_frames = tuple(range(1, N_FRAMES))  # skip t=0: mirror real-expt warm-up
     mic = _run_pipeline(
@@ -332,7 +341,7 @@ def test_stim_masks_centered_on_cells(tmp_dir):
         n_frames=N_FRAMES,
         stimulator=StimPerCellCenter(radius=2),
         stim_frames=stim_frames,
-        stim_mode="current",
+        stim_mode=stim_mode,
     )
 
     slm_events = mic.scene.slm_events
@@ -341,13 +350,13 @@ def test_stim_masks_centered_on_cells(tmp_dir):
         f"Expected {len(stim_frames)} SLM events, got {len(slm_events)}"
     )
 
+    gt_offset = -1 if stim_mode == "previous" else 0
     distances = []
     mask_counts = []
     for t, mask in slm_events:
-        gt = mic.scene.gt[t]
+        gt = mic.scene.gt[t + gt_offset]
         centroids = _mask_blob_centroids(mask)
         mask_counts.append(len(centroids))
-        # Nearest-GT-cell for each mask blob.
         for cy, cx in centroids:
             d = np.sqrt(((gt[:, 0] - cy) ** 2 + (gt[:, 1] - cx) ** 2).min())
             distances.append(d)
@@ -357,14 +366,51 @@ def test_stim_masks_centered_on_cells(tmp_dir):
     for t, n in zip([e[0] for e in slm_events], mask_counts):
         assert (
             n >= N_CELLS - 1
-        ), f"Stim frame t={t}: {n} mask blobs, expected ≥{N_CELLS - 1}"
+        ), f"[{stim_mode}] stim frame t={t}: {n} mask blobs, expected ≥{N_CELLS - 1}"
 
     distances = np.asarray(distances)
     # Centroid of a thresholded disk sits within ~1 px of the rendered
     # cell centre; allow 2 px median and 4 px worst-case.
     assert np.median(distances) <= 2.0, (
-        f"Median mask-to-cell distance {np.median(distances):.2f}px too large"
+        f"[{stim_mode}] median mask-to-cell distance "
+        f"{np.median(distances):.2f}px too large"
     )
     assert np.max(distances) <= 4.0, (
-        f"Max mask-to-cell distance {np.max(distances):.2f}px too large"
+        f"[{stim_mode}] max mask-to-cell distance "
+        f"{np.max(distances):.2f}px too large"
+    )
+
+
+def test_previous_mode_mask_is_one_frame_behind_cells(tmp_dir):
+    """Regression guard: in ``previous`` mode the dispatched mask reflects
+    frame ``t-1``, not frame ``t`` — i.e. measuring against ``gt[t]`` must
+    surface roughly one frame of drift. If the pipeline ever accidentally
+    routed the "current" frame's mask here, this test's floor would fail.
+    """
+    stim_frames = tuple(range(1, N_FRAMES))
+    mic = _run_pipeline(
+        TrackerTrackpy(search_range=SEARCH_RANGE, memory=MEMORY),
+        tmp_dir,
+        n_frames=N_FRAMES,
+        stimulator=StimPerCellCenter(radius=2),
+        stim_frames=stim_frames,
+        stim_mode="previous",
+    )
+
+    # Displacement between the dispatched mask centroids and the
+    # current-frame GT positions. We expect ~1 frame of drift per cell
+    # (the scene's per-frame velocity has std 1 px on each axis).
+    per_cell_drift = []
+    for t, mask in mic.scene.slm_events:
+        gt = mic.scene.gt[t]
+        for cy, cx in _mask_blob_centroids(mask):
+            d = np.sqrt(((gt[:, 0] - cy) ** 2 + (gt[:, 1] - cx) ** 2).min())
+            per_cell_drift.append(d)
+
+    # Median displacement should be clearly nonzero — otherwise the test
+    # would also pass with mode="current" and wouldn't catch a regression.
+    median_drift = float(np.median(per_cell_drift))
+    assert median_drift >= 0.5, (
+        f"Expected ~1 frame of drift between mask and current-frame cells, "
+        f"got median {median_drift:.2f}px — mask may not actually be from t-1."
     )

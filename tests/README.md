@@ -19,7 +19,9 @@ are auto-skipped without `--scope <moench|niesen|jungfrau>` (or
 | File | What it covers |
 |------|----------------|
 | `test_contracts.py` | API contracts: every Segmentator returns a 2D int array, every Tracker returns a DataFrame with the required columns, etc. Narrow, fast unit tests. |
-| `test_pipeline_integration.py` | End-to-end Controller → Pipeline → Writer against `FakeMicroscope`. Parametrised across Trackpy/Motile. |
+| `test_pipeline_integration.py` | Happy-path end-to-end + continue/extend/no-cell edge cases. Parametrised across Trackpy/Motile. |
+| `test_pipeline_stim.py` | Stim-branch end-to-end: `current`/`previous` mode mask selection, all three stimulator shortcuts (`Stim`/`StimWithImage`/`StimWithPipeline`), stim-mask-timeout. |
+| `test_pipeline_failures.py` | Crash handling (each pipeline stage fails), slow-segmentation stress, 100-frame burst. |
 | `test_tracking_accuracy.py` | Tracker accuracy on 50 moving cells with ground truth; stim-mask alignment. |
 | `test_tracking_divisions.py` | Cell division handling for both trackers. |
 | `test_writers.py` | TIFF + OME-Zarr schema: shapes, axis order, plate layout. |

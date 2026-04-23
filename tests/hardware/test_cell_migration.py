@@ -47,7 +47,6 @@ from faro.core.pipeline import ImageProcessingPipeline
 from faro.core.writers import OmeZarrWriter
 from faro.feature_extraction.optocheck import OptoCheckFE
 from faro.feature_extraction.simple import SimpleFE
-from faro.segmentation.cellpose_v4 import CellposeV4
 from faro.stimulation.percentage_of_cell import StimPercentageOfCell
 from faro.tracking.trackpy import TrackerTrackpy
 from tests.hardware.conftest import assert_clean_run
@@ -102,6 +101,8 @@ def test_cell_migration_smoke(
         # StimPercentageOfCell reads this from per-event metadata.
         rtm_metadata={"stim_cell_percentage": STIM_CELL_PERCENTAGE},
     )
+
+    from faro.segmentation.cellpose_v4 import CellposeV4
 
     pipeline = ImageProcessingPipeline(
         storage_path=str(tmp_path),

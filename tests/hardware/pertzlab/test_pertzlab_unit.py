@@ -1,7 +1,14 @@
-"""Tests for auto-detection of power properties from Micro-Manager configs.
+"""Pure-Python unit tests for Pertzlab-specific faro code.
 
-These tests are specific to the Pertzlab microscope setups (Spectra / LedDMD
-light sources with *_Level properties and DA TTL LED state devices).
+Lives under ``tests/hardware/pertzlab/`` because its subjects are
+Pertzlab-scope-only: :func:`faro.core.utils.detect_power_properties`
+exercised with the Spectra / LedDMD / DA TTL LED configuration shapes
+we actually use, and
+:class:`faro.microscope.pertzlab.moench.MoenchMDAEngine`'s
+``SKIP_WAIT_DEVICES`` filter.
+
+These do **not** require a real scope and are **not** marked
+``@pytest.mark.hardware``; they run in every test session.
 """
 
 from __future__ import annotations

@@ -24,7 +24,7 @@ are auto-skipped without `--scope <moench|niesen|jungfrau>` (or
 | `test_tracking_divisions.py` | Cell division handling for both trackers. |
 | `test_writers.py` | TIFF + OME-Zarr schema: shapes, axis order, plate layout. |
 | `test_validate_hardware.py` | Pre-flight `validate_hardware` checks (channel existence, exposure/power limits). |
-| `test_hardware_pertzlab.py` | `detect_power_properties` auto-detection on Spectra/LedDMD configs. |
+| `hardware/pertzlab/test_pertzlab_unit.py` | Pertzlab-specific unit tests (power-property detection, `SKIP_WAIT_DEVICES`). Not hardware-gated; uses fakes. |
 | `test_event_ordering.py` | `RTMSequence.iter_events` axis-order semantics. |
 | `test_events_to_dataframe.py` | Event-list → DataFrame serialization. |
 | `test_frame_dispenser.py` | Concurrent put/get primitives used by the pipeline threads. |

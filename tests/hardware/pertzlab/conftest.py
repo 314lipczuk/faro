@@ -32,7 +32,6 @@ import pytest
 import zarr
 
 from faro.core.data_structures import SegmentationMethod
-from faro.segmentation.cellpose_v4 import CellposeV4
 from faro.stimulation.base import StimWithImage
 from tests.conftest import resolve_scope
 
@@ -436,7 +435,13 @@ def cellpose_segmentator() -> SegmentationMethod:
     that cost on every subsequent test. Hardware tests that need a
     different ``min_size`` or weight set should build their own
     ``SegmentationMethod`` instead of using this fixture.
+
+    Cellpose is imported lazily so this conftest loads even when
+    cellpose is unavailable (e.g. numpy/numba version skew on a dev
+    machine). Only actual hardware-gated tests request this fixture.
     """
+    from faro.segmentation.cellpose_v4 import CellposeV4
+
     return SegmentationMethod(
         name="labels",
         segmentation_class=CellposeV4(min_size=50, gpu=True),

@@ -48,6 +48,32 @@ Shared helpers live in:
 pytest-collected — they're dev scripts that write outputs to disk for
 napari inspection.
 
+## What the built-in scenes look like
+
+![CircleScene](assets/scene_circle.png)
+
+`CircleScene` (`tests/fixtures.py`): two bright uint16 circles at fixed
+positions on a 256×256 black background. Default scene for end-to-end
+pipeline tests — the segmenter always finds exactly two labels.
+
+![SyntheticCellScene](assets/scene_synthetic_cells.png)
+
+`SyntheticCellScene` (`tests/test_tracking_accuracy.py`): 50 cells
+rendered as small disks with deterministic linear drift plus Brownian
+noise. Used by the tracking-accuracy suite; known per-frame ground
+truth lives on `scene.gt[t]`.
+
+![Stim mask alignment](assets/stim_mask_overlay.png)
+
+When the pipeline runs with `StimPerCellCenter` stim the scene
+captures each dispatched SLM mask in `scene.slm_events`. The mask's
+blob centroids should sit on top of the GT cell positions — the
+stim-alignment test (`test_stim_masks_centered_on_cells`) asserts that
+median offset ≤ 2 px.
+
+Regenerate the images with `python -m tests.assets.generate` after
+editing a scene.
+
 ## Writing a new test
 
 ### Unit test for a new Segmentator / Stim / FE

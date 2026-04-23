@@ -6,9 +6,6 @@ Covers the stim branch of the Controller end-to-end under both
 the three stimulator shortcut paths (:class:`Stim`,
 :class:`StimWithImage`, :class:`StimWithPipeline`) and the Analyzer's
 stim-mask-timeout background-error recording.
-
-Split out of :mod:`tests.test_pipeline_integration` in 2026-04 when
-the combined file passed 1500 lines; see :doc:`tests/README.md`.
 """
 
 from __future__ import annotations
@@ -22,40 +19,21 @@ import pytest
 import tifffile
 
 from faro.core.controller import Analyzer, Controller
-from faro.core.data_structures import (
-    Channel,
-    RTMEvent,
-    SegmentationMethod,
-)
-from faro.core.pipeline import ImageProcessingPipeline
-from faro.feature_extraction.simple import SimpleFE
-from faro.segmentation.base import OtsuSegmentator
+from faro.core.data_structures import Channel, RTMEvent
 from faro.stimulation.base import Stim, StimWithImage, StimWithPipeline
-from faro.stimulation.center_circle import CenterCircle
 
 from tests.fake_microscope import FakeMicroscope
 from tests.fixtures import (
     CircleScene,
+    CrashingStimulator,
     make_events,
+    make_pipeline as _make_pipeline,
     run_and_wait,
     tracker,  # noqa: F401 — parametrized fixture, auto-discovered by pytest
 )
-from tests.fixtures import make_pipeline as _make_pipeline
 
 
 N_TIMEPOINTS = 5
-
-
-class CrashingStimulator(CenterCircle):
-    """StimWithPipeline that raises on every stim call.
-
-    Used by :class:`TestStimModePreviousPipelineCrashDoesNotDeadlock` to
-    verify the controller falls back gracefully instead of holding on
-    to the 80s stim-mask timeout when the pipeline's stim path throws.
-    """
-
-    def get_stim_mask(self, label_images, metadata=None, img=None, tracks=None):
-        raise RuntimeError("Stimulation crashed!")
 
 
 # ===================================================================
@@ -200,15 +178,6 @@ def _sole_mask_value(mask: np.ndarray) -> int:
     return int(unique.item())
 
 
-def _make_pipeline_with_stim(path, stimulator, *, tracker):
-    """Build a pipeline with a specific stimulator for shortcut testing."""
-    return ImageProcessingPipeline(
-        storage_path=path,
-        segmentators=[SegmentationMethod("labels", OtsuSegmentator(), 0, False)],
-        tracker=tracker,
-        feature_extractor=SimpleFE("labels"),
-        stimulator=stimulator,
-    )
 # ===================================================================
 # End-to-end stim-mode mask-selection tests (CircleScene with_slm=True)
 #
@@ -228,8 +197,8 @@ class TestStimModeMaskSelectionCurrent:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, _FrameTaggingStim(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=_FrameTaggingStim()
         )
         self.mic = FakeMicroscope(CircleScene(with_slm=True))
         self.ctrl = Controller(self.mic, self.pipeline)
@@ -263,8 +232,8 @@ class TestStimModeMaskSelectionPrevious:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, _FrameTaggingStim(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=_FrameTaggingStim()
         )
         self.mic = FakeMicroscope(CircleScene(with_slm=True))
         self.ctrl = Controller(self.mic, self.pipeline)
@@ -298,8 +267,8 @@ class TestStimModeCurrentAtFrameZero:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, _FrameTaggingStim(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=_FrameTaggingStim()
         )
         self.mic = FakeMicroscope(CircleScene(with_slm=True))
         self.ctrl = Controller(self.mic, self.pipeline)
@@ -345,8 +314,8 @@ class TestStimModePreviousMultiFov:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, _FrameTaggingStim(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=_FrameTaggingStim()
         )
         self.mic = FakeMicroscope(CircleScene(with_slm=True))
         self.ctrl = Controller(self.mic, self.pipeline)
@@ -379,8 +348,8 @@ class TestStimModePreviousAtFrameZero:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, MetadataOnlyStim(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=MetadataOnlyStim()
         )
         self.mic = FakeMicroscope(CircleScene(with_slm=True))
         self.ctrl = Controller(self.mic, self.pipeline)
@@ -401,9 +370,13 @@ class TestStimModePreviousPipelineCrashDoesNotDeadlock:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, CrashingStimulator(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=CrashingStimulator()
         )
+        # Short queue timeout: without this, each pipeline stim-mask
+        # wait would block for the full 20 s default, doubling test
+        # runtime to ~40 s per parametrize instance.
+        self.pipeline._queue_timeout = 1
         self.mic = FakeMicroscope(CircleScene(with_slm=True))
         self.ctrl = Controller(self.mic, self.pipeline)
         events = make_events(4, stim_frames=(2, 3))
@@ -451,7 +424,7 @@ class TestCurrentModeSkipsComputeOnNonStim:
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
         self.stim = _CountingStim()
-        self.pipeline = _make_pipeline_with_stim(self.path, self.stim, tracker=tracker)
+        self.pipeline = _make_pipeline(self.path, tracker=tracker, stimulator=self.stim)
         self.mic = FakeMicroscope(CircleScene(with_slm=True))
         self.ctrl = Controller(self.mic, self.pipeline)
         events = make_events(5, stim_frames=(2, 3))
@@ -470,7 +443,7 @@ class TestPreviousModeComputesOnEveryFrame:
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
         self.stim = _CountingStim()
-        self.pipeline = _make_pipeline_with_stim(self.path, self.stim, tracker=tracker)
+        self.pipeline = _make_pipeline(self.path, tracker=tracker, stimulator=self.stim)
         self.mic = FakeMicroscope(CircleScene(with_slm=True))
         self.ctrl = Controller(self.mic, self.pipeline)
         events = make_events(5, stim_frames=(2, 3))
@@ -495,8 +468,8 @@ class TestStimMaskFileReflectsFired:
     N_FRAMES = 5
 
     def test_stored_mask_is_fired_mask(self, tmp_dir, tracker, stim_mode, tag_offset):
-        pipeline = _make_pipeline_with_stim(
-            tmp_dir, _FrameTaggingStim(), tracker=tracker
+        pipeline = _make_pipeline(
+            tmp_dir, tracker=tracker, stimulator=_FrameTaggingStim()
         )
         ctrl = Controller(FakeMicroscope(CircleScene(with_slm=True)), pipeline)
         events = make_events(self.N_FRAMES, stim_frames=self.STIM_FRAMES)
@@ -532,8 +505,8 @@ class TestStimMetadataOnlyCurrent:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, MetadataOnlyStim(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=MetadataOnlyStim()
         )
         self.mic = FakeMicroscope(CircleScene())
         self.ctrl = Controller(self.mic, self.pipeline)
@@ -586,8 +559,8 @@ class TestStimMetadataOnlyPrevious:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, MetadataOnlyStim(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=MetadataOnlyStim()
         )
         self.mic = FakeMicroscope(CircleScene())
         self.ctrl = Controller(self.mic, self.pipeline)
@@ -622,8 +595,8 @@ class TestStimWithImageCurrent:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, ImageBasedStim(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=ImageBasedStim()
         )
         self.mic = FakeMicroscope(CircleScene())
         self.ctrl = Controller(self.mic, self.pipeline)
@@ -675,8 +648,8 @@ class TestStimWithImagePrevious:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(
-            self.path, ImageBasedStim(), tracker=tracker
+        self.pipeline = _make_pipeline(
+            self.path, tracker=tracker, stimulator=ImageBasedStim()
         )
         self.mic = FakeMicroscope(CircleScene())
         self.ctrl = Controller(self.mic, self.pipeline)
@@ -714,8 +687,8 @@ class TestStimMaskTimeout:
 
     @pytest.fixture
     def analyzer(self, tmp_dir, tracker) -> Iterator[Analyzer]:
-        pipeline = _make_pipeline_with_stim(
-            tmp_dir, ImageBasedStim(), tracker=tracker
+        pipeline = _make_pipeline(
+            tmp_dir, tracker=tracker, stimulator=ImageBasedStim()
         )
         instance = Analyzer(pipeline=pipeline)
         yield instance

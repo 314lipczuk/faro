@@ -1,18 +1,13 @@
 """Tracking behavior around cell divisions.
 
-Two layers of test:
-
-1. **Tracker-agnostic**: after a 1-to-2 cell split, both daughters are
-   tracked through the rest of the run with persistent particle IDs.
-   Runs against both Trackpy and Motile.
-
-2. **Motile-specific lineage**: when Motile's solver decides a detection
-   pair is a division, each child's row carries a ``parent_particle``
-   column pointing back to the dividing tip. Trackpy produces no such
-   column (trackers can add their own columns without base-class
-   changes). Division handling in Motile is tuned with a strongly
-   negative ``split_cost`` so the ILP actually picks the split over
-   an appear event for the test scene.
+* **Tracker-agnostic**: after a 1-to-2 cell split, both daughters are
+  tracked through the rest of the run with persistent particle IDs.
+  Parametrised across Trackpy and Motile.
+* **Trackpy lacks a lineage column**: ``parent_particle`` is absent
+  from Trackpy output (trackers may add their own columns).
+* **Motile records parent on divisions**: with a strongly negative
+  ``split_cost`` the ILP picks the split, and each child's
+  ``parent_particle`` points back to the dividing tip.
 """
 
 from __future__ import annotations
@@ -33,6 +28,7 @@ from faro.tracking.motile_tracker import TrackerMotile
 from faro.tracking.trackpy import TrackerTrackpy
 
 from tests.fake_microscope import FakeMicroscope
+from tests.fixtures import render_disks
 
 
 IMG_SIZE = 128
@@ -43,12 +39,10 @@ N_FRAMES = 6
 DAUGHTER_SEPARATION = 12  # px between the two daughters after division
 
 
-def _render_disks(positions: np.ndarray) -> np.ndarray:
-    img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint16)
-    yy, xx = np.ogrid[:IMG_SIZE, :IMG_SIZE]
-    for r, c in positions:
-        img[(yy - r) ** 2 + (xx - c) ** 2 <= CELL_RADIUS**2] = CELL_VALUE
-    return img
+def _render(positions: np.ndarray) -> np.ndarray:
+    return render_disks(
+        positions, img_size=IMG_SIZE, radius=CELL_RADIUS, value=CELL_VALUE
+    )
 
 
 class _DividingCellScene:
@@ -71,10 +65,10 @@ class _DividingCellScene:
     def render(self, event: MDAEvent) -> np.ndarray:
         t = event.index.get("t", 0)
         if t < DIVISION_FRAME:
-            return _render_disks(np.array([[self._cy, self._cx]]))
+            return _render(np.array([[self._cy, self._cx]]))
         drift = t - DIVISION_FRAME
         half = DAUGHTER_SEPARATION // 2
-        return _render_disks(
+        return _render(
             np.array(
                 [
                     [self._cy, self._cx - half - drift],

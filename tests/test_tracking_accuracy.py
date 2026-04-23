@@ -30,6 +30,7 @@ from faro.tracking.motile_tracker import TrackerMotile
 from faro.tracking.trackpy import TrackerTrackpy
 
 from tests.fake_microscope import FakeMicroscope
+from tests.fixtures import render_disks
 
 IMG_SIZE = 256
 N_CELLS = 50
@@ -90,14 +91,13 @@ def _make_gt(n_cells: int, n_frames: int, seed: int = 0) -> list[np.ndarray]:
 
 
 def _render_frame(positions: np.ndarray, offset=(0, 0)) -> np.ndarray:
-    """Render disks at the given (row, col) positions, optionally shifted."""
-    img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint16)
-    yy, xx = np.ogrid[:IMG_SIZE, :IMG_SIZE]
-    dr, dc = offset
-    for r, c in positions:
-        mask = (yy - (r + dr)) ** 2 + (xx - (c + dc)) ** 2 <= CELL_RADIUS**2
-        img[mask] = CELL_VALUE
-    return img
+    return render_disks(
+        positions,
+        img_size=IMG_SIZE,
+        radius=CELL_RADIUS,
+        value=CELL_VALUE,
+        offset=offset,
+    )
 
 
 class SyntheticCellScene:

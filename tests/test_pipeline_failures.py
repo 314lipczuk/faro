@@ -9,9 +9,6 @@ Covers:
   still save raw images and leave downstream workers unblocked.
 * ``TestBurstNoSignalLoss`` — 100-frame burst against a near-instant
   tiny pipeline; no frames should be dropped under back-pressure.
-
-Split out of :mod:`tests.test_pipeline_integration` in 2026-04 when
-the combined file passed 1500 lines; see :doc:`tests/README.md`.
 """
 
 from __future__ import annotations
@@ -21,7 +18,6 @@ import shutil
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
 
 import numpy as np
 import pandas as pd
@@ -39,18 +35,12 @@ from faro.tracking.trackpy import TrackerTrackpy
 from tests.fake_microscope import FakeMicroscope
 from tests.fixtures import (
     CircleScene,
+    CrashingStimulator,
     make_events,
     run_and_wait,
     run_and_wait_long,
     tracker,  # noqa: F401 — parametrized fixture, auto-discovered by pytest
 )
-
-
-class CrashingStimulator(CenterCircle):
-    """Stimulator that raises on every stim call."""
-
-    def get_stim_mask(self, label_images, metadata=None, img=None, tracks=None):
-        raise RuntimeError("Stimulation crashed!")
 
 
 class SlowSegmentator(OtsuSegmentator):
@@ -375,7 +365,7 @@ class _TinyScene:
     image_width = 16
     channels = ("phase-contrast",)
 
-    def render(self, event: MDAEvent) -> np.ndarray:
+    def render(self, event) -> np.ndarray:
         return _make_tiny_image()
 
 

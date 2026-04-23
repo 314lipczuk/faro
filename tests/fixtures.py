@@ -49,6 +49,43 @@ from faro.tracking.motile_tracker import TrackerMotile
 from faro.tracking.trackpy import TrackerTrackpy
 
 
+def render_disks(
+    positions: np.ndarray,
+    *,
+    img_size: int,
+    radius: int,
+    value: int,
+    offset: tuple[int, int] = (0, 0),
+    dtype=np.uint16,
+) -> np.ndarray:
+    """Render filled disks at each (row, col) position into a blank frame.
+
+    Small helper used by the two synthetic-cell scenes
+    (:class:`~tests.test_tracking_accuracy.SyntheticCellScene` and the
+    one in :mod:`tests.test_tracking_divisions`). ``offset`` lets a
+    caller shift all disks, e.g. for a second imaging channel with a
+    registration offset.
+    """
+    img = np.zeros((img_size, img_size), dtype=dtype)
+    yy, xx = np.ogrid[:img_size, :img_size]
+    dr, dc = offset
+    for r, c in positions:
+        img[(yy - (r + dr)) ** 2 + (xx - (c + dc)) ** 2 <= radius**2] = value
+    return img
+
+
+class CrashingStimulator(CenterCircle):
+    """Stimulator whose ``get_stim_mask`` always raises.
+
+    Used by failure-path tests to verify the pipeline's crash handling
+    unblocks downstream stim-mask consumers instead of deadlocking on
+    the per-frame queue timeout.
+    """
+
+    def get_stim_mask(self, label_images, metadata=None, img=None, tracks=None):
+        raise RuntimeError("Stimulation crashed!")
+
+
 IMG_SIZE = 256
 CIRCLE1_CENTER = (64, 64)  # (row, col)
 CIRCLE1_RADIUS = 20

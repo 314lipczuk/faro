@@ -95,9 +95,14 @@ class Moench(PyMMCoreMicroscope):
         "property_name": "Cyan_Level",
         "power": 10,
     }
+    BINNING = "2x2"
+    # ROI: full width (no x crop), symmetric top-bottom crop to ROI_HEIGHT.
+    # ROI_X / ROI_Y / ROI_WIDTH are recomputed in set_roi() against the
+    # live camera dimensions so the values stay correct under any binning.
+    # Defaults below match Prime BSI (2048 unbinned -> 1024 with 2x2).
     ROI_X = 0
-    ROI_Y = 60
-    ROI_WIDTH = 800
+    ROI_Y = 112
+    ROI_WIDTH = 1024
     ROI_HEIGHT = 800
     SET_ROI_REQUIRED = True
 
@@ -126,6 +131,11 @@ class Moench(PyMMCoreMicroscope):
         """Initialize the microscope."""
         self.mmc.loadSystemConfiguration(self.MICROMANAGER_CONFIG)
         self.mmc.setConfig(groupName="System", configName="Startup")
+        # Pin camera binning before set_roi(): MM camera drivers reset
+        # the ROI on a binning change, so binning must come first.
+        self.mmc.setConfig("Binning", self.BINNING)
+        if self.SET_ROI_REQUIRED:
+            self.set_roi()
         self.register_engine()
 
         self.slm_dev = self.mmc.getSLMDevice()
@@ -167,7 +177,19 @@ class Moench(PyMMCoreMicroscope):
             self.wakeup_dmd.run()
 
     def set_roi(self):
+        """Apply full-width, symmetric top-bottom ROI of height ROI_HEIGHT.
+
+        Recomputes ROI_X / ROI_Y / ROI_WIDTH from the camera's live
+        full-frame dimensions under the active binning, then writes
+        them back to the instance so downstream callers reading
+        ``mic.ROI_*`` see the actual values in effect.
+        """
         self.mmc.clearROI()
+        full_w = self.mmc.getImageWidth()
+        full_h = self.mmc.getImageHeight()
+        self.ROI_X = 0
+        self.ROI_Y = max(0, (full_h - self.ROI_HEIGHT) // 2)
+        self.ROI_WIDTH = full_w
         self.mmc.setROI(self.ROI_X, self.ROI_Y, self.ROI_WIDTH, self.ROI_HEIGHT)
 
     def post_experiment(self):

@@ -234,9 +234,6 @@ class DMD:
         @self.mmc.mda.events.frameReady.connect
         def new_frame(img: np.ndarray, event: MDAEvent):
             calibration_images.append(img)
-            if verbose:
-                plt.imshow(img, cmap="gray")
-                plt.show()
 
         for event in events:
             self.mmc.mda.run([event])
@@ -248,6 +245,29 @@ class DMD:
             max_x = np.argmax(img.max(axis=0))
             max_y = np.argmax(img.max(axis=1))
             dst.append((max_x, max_y))
+
+        if verbose:
+            n = len(calibration_images)
+            cols = int(np.ceil(np.sqrt(n)))
+            rows = int(np.ceil(n / cols))
+            fig, axs = plt.subplots(
+                rows, cols, figsize=(3 * cols, 3 * rows), dpi=120, squeeze=False
+            )
+            for ax, img, (mx, my), (sx, sy) in zip(
+                axs.flat, calibration_images, dst, src
+            ):
+                ax.imshow(img, cmap="gray")
+                ax.scatter(
+                    mx, my, marker="o", s=120,
+                    facecolors="none", edgecolors="red", linewidths=1.2,
+                )
+                ax.set_title(f"DMD ({sx},{sy}) -> cam ({mx},{my})", fontsize=8)
+                ax.axis("off")
+            for ax in axs.flat[n:]:
+                ax.axis("off")
+            fig.suptitle("Calibration frames with detected spots (red x)")
+            fig.tight_layout()
+            plt.show()
 
         src = np.array(src)
         dst = np.array(dst)
@@ -292,9 +312,14 @@ class DMD:
             test_image = []
             test_src = []
             test_dst = []
-            p0, p1, p2 = ([100, 500], [600, 350], [500, 800])
             camera_height = self.mmc.getImageHeight()
             camera_width = self.mmc.getImageWidth()
+            # Scale test points to the live camera dimensions. Hardcoded
+            # values fall outside the ROI/binning combo on most setups,
+            # which leaves img_p empty -> img_warp empty -> no spot fires.
+            p0 = [camera_height // 4, camera_width // 4]
+            p1 = [camera_height // 2, camera_width // 2]
+            p2 = [3 * camera_height // 4, 3 * camera_width // 4]
 
             for p in [p0, p1, p2]:
                 img_p = np.zeros((camera_height, camera_width)).astype(np.uint8)
@@ -303,10 +328,13 @@ class DMD:
                 img_p[rr, cc] = 255
                 img_warp = self.affine_transform(img_p)
 
+                # No exposure on SLMImage — match the calibration events
+                # above. Setting SLM exposure to ``exposure`` (e.g. 25 ms)
+                # blanks the DMD long before the camera opens when the
+                # scope is in OverlapMode=Off (which the focus-aid cells
+                # leave it in), so the test capture comes back blank.
                 event_p = MDAEvent(
-                    slm_image=SLMImage(
-                        data=img_warp, device=self.name, exposure=exposure
-                    ),
+                    slm_image=SLMImage(data=img_warp, device=self.name),
                     exposure=exposure,
                     channel={
                         "config": self.calibration_profile["channel_config"],
@@ -346,18 +374,26 @@ class DMD:
             for i in range(3):
                 axs[i].imshow(test_image[i], cmap="gray")
                 axs[i].scatter(
-                    test_dst[i][0], test_dst[i][1], marker="x", facecolors="red"
+                    test_dst[i][0], test_dst[i][1], marker="o", s=120,
+                    facecolors="none", edgecolors="red", linewidths=1.2,
+                    label="detected" if i == 0 else None,
                 )
                 axs[i].scatter(
-                    test_src[i][0], test_src[i][1], marker="x", facecolors="green"
+                    test_src[i][0], test_src[i][1], marker="o", s=120,
+                    facecolors="none", edgecolors="lime", linewidths=1.2,
+                    label="requested" if i == 0 else None,
                 )
+                if i == 0:
+                    axs[i].legend(loc="upper right", fontsize=8)
 
             for i in range(3):
                 axs[3].scatter(
-                    test_src[i][0], test_src[i][1], marker="x", facecolor="red"
+                    test_dst[i][0], test_dst[i][1], marker="o", s=120,
+                    facecolors="none", edgecolors="red", linewidths=1.2,
                 )
                 axs[3].scatter(
-                    test_dst[i][0], test_dst[i][1], marker="x", facecolor="green"
+                    test_src[i][0], test_src[i][1], marker="o", s=120,
+                    facecolors="none", edgecolors="lime", linewidths=1.2,
                 )
             axs[3].set_xlim(0, camera_width)
             axs[3].set_ylim(camera_height, 0)

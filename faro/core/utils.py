@@ -821,9 +821,12 @@ def merge_rtm_sequences(
     else:
         n_parallel = total_fovs
 
-    # 3. Group FOVs into parallel batches
+    # 3. Group FOVs into parallel batches.
+    # Wall-clock (min_start_time) is offset per batch so events stay in
+    # chronological order; the ``t`` index is *not* offset, so every FOV
+    # writes to its own per-FOV-relative t in the zarr store and overflow
+    # batches stack along p instead of along t.
     result: list[RTMEvent] = []
-    t_offset = 0
     time_offset = 0.0
 
     for batch_start in range(0, total_fovs, n_parallel):
@@ -831,22 +834,12 @@ def merge_rtm_sequences(
 
         for fov_evs in batch:
             for ev in fov_evs:
-                new_t = ev.index.get("t", 0) + t_offset
                 new_time = (ev.min_start_time or 0) + time_offset
-                result.append(
-                    ev.model_copy(
-                        update={
-                            "index": {**dict(ev.index), "t": new_t},
-                            "min_start_time": new_time,
-                        }
-                    )
-                )
+                result.append(ev.model_copy(update={"min_start_time": new_time}))
 
         # Offset for next batch: last timepoint start + time to image batch FOVs
         batch_max_time = max(e.min_start_time or 0 for fov in batch for e in fov)
-        batch_max_t = max(e.index.get("t", 0) for fov in batch for e in fov)
         time_offset += batch_max_time + len(batch) * time_per_fov
-        t_offset += batch_max_t + 1
 
     result.sort(key=lambda e: (e.min_start_time or 0, e.index.get("p", 0)))
     return result
@@ -941,10 +934,12 @@ def apply_fov_batching(
     # Map each FOV to its batch index
     fov_to_batch = {fov: i // n_parallel for i, fov in enumerate(fov_ids)}
 
-    # Compute per-batch offsets
-    # Batch 0 events determine the experiment duration
+    # Per-batch wall-clock offset only — the ``t`` index stays per-FOV
+    # relative (every FOV uses 0..N-1) so the writer's time axis is
+    # aligned across batches instead of concatenated. Without this each
+    # batch was mapped to a disjoint slab of t and the zarr store had
+    # n_batches * N empty rows per FOV.
     batch0_events = [e for e in events if fov_to_batch[e.index.get("p", 0)] == 0]
-    max_t_batch0 = max(e.index.get("t", 0) for e in batch0_events)
     max_time_batch0 = max(e.min_start_time or 0 for e in batch0_events)
     batch_duration = max_time_batch0 + n_parallel * time_per_fov
 
@@ -955,18 +950,9 @@ def apply_fov_batching(
         if batch == 0:
             result.append(ev)
         else:
-            t_offset = batch * (max_t_batch0 + 1)
             time_offset = batch * batch_duration
-            new_t = ev.index.get("t", 0) + t_offset
             new_time = (ev.min_start_time or 0) + time_offset
-            result.append(
-                ev.model_copy(
-                    update={
-                        "index": {**dict(ev.index), "t": new_t},
-                        "min_start_time": new_time,
-                    }
-                )
-            )
+            result.append(ev.model_copy(update={"min_start_time": new_time}))
 
     result.sort(key=lambda e: (e.min_start_time or 0, e.index.get("p", 0)))
     return result

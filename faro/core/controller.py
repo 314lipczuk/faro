@@ -849,12 +849,37 @@ class Controller:
                     suppress_stim=suppress,
                 )
                 slm = None
+                mic_dmd = self._mic.dmd
+                needs_wake = (
+                    mic_dmd is not None
+                    and getattr(self._mic, "dmd_needs_to_be_waken", False)
+                )
                 for ev in planned:
                     if ev.metadata.get("img_type") == ImgType.IMG_STIM:
-                        if slm is None and self._mic.dmd:
+                        if slm is None and mic_dmd:
                             slm = self._build_stim_slm(rtm_event, stim_mode=stim_mode)
                         if slm is not None:
                             ev = ev.model_copy(update={"slm_image": slm})
+                    elif needs_wake:
+                        # Hold the DMD all-on for every imaging/ref capture.
+                        # Without this, OverlapMode=On keeps re-pulsing the
+                        # last-loaded SLM pattern (typically the previous
+                        # FOV's stim pattern) on every camera TTL, blacking
+                        # out subsequent imaging until KeepDMDAlive refreshes
+                        # at its 60 s cadence — which is too slow during the
+                        # tight burst of events at a stim timepoint under FOV
+                        # batching. Pre-refactor this was emitted by
+                        # Controller._queue_channels via _make_slm; the
+                        # refactor in f26b54e dropped the call by accident.
+                        ev = ev.model_copy(
+                            update={
+                                "slm_image": SLMImage(
+                                    data=True,
+                                    device=mic_dmd.name,
+                                    exposure=ev.exposure,
+                                )
+                            }
+                        )
                     self._put_event(ev)
         finally:
             self._event_queue = None

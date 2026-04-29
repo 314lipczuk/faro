@@ -413,7 +413,7 @@ def generate_fov_positions_from_list(mic, data_mda_fovs):
     """Create FovPosition namedtuples from a list of position dicts."""
     fovs = []
     for i, fov in enumerate(data_mda_fovs):
-        z = None if getattr(mic, "ONLY_USE_PFS", False) else fov.get("z")
+        z = None if getattr(mic, "USE_ONLY_PFS", False) else fov.get("z")
         name = str(i) if fov.get("name") is None else fov["name"]
         fovs.append(FovPosition(x=fov.get("x"), y=fov.get("y"), z=z, name=name))
     return fovs

@@ -1,3 +1,4 @@
+import threading
 import warnings
 
 warnings.filterwarnings("ignore", message="Sparse invariant checks")
@@ -29,14 +30,25 @@ class CellposeV4(Segmentator):
             self.model = models.CellposeModel(
                 pretrained_model=custom_model_path, gpu=gpu
             )
+        # Analyzer.executor runs up to ``max_workers`` pipeline tasks at
+        # once — under FOV batching that is one task per FOV in a batch
+        # firing nearly simultaneously. ``CellposeModel.eval`` is not
+        # thread-safe (shared internal buffers + a single CUDA context
+        # under PyTorch), and overlapping calls have been observed to
+        # silently return empty/corrupt masks for an entire batch of
+        # FOVs while the next batch works. Serialize ``.eval`` here so
+        # at most one segmentation runs at a time. Tracking, feature
+        # extraction, and storage stay parallel across FOVs.
+        self._eval_lock = threading.Lock()
 
     def segment(self, image: np.ndarray) -> np.ndarray:
 
-        masks, flows, styles = self.model.eval(
-            image,
-            flow_threshold=self.flow_threshold,
-            cellprob_threshold=self.cellprob_threshold,
-        )
+        with self._eval_lock:
+            masks, flows, styles = self.model.eval(
+                image,
+                flow_threshold=self.flow_threshold,
+                cellprob_threshold=self.cellprob_threshold,
+            )
 
         if self.min_size > 0:
             # remove cells below threshold

@@ -774,6 +774,11 @@ class Controller:
                     and fov_index not in _stim_pending
                 )
 
+                mic_dmd = self._mic.dmd
+                needs_wake = (
+                    mic_dmd is not None
+                    and getattr(self._mic, "dmd_needs_to_be_waken", False)
+                )
                 for ev in rtm_event.plan_events(
                     stim_mode=stim_mode,
                     build_slm=self._build_stim_slm if self._mic.dmd else None,
@@ -781,6 +786,30 @@ class Controller:
                     resolve_power=self._mic.resolve_power,
                     suppress_stim=suppress_stim,
                 ):
+                    # Hold the DMD all-on for every non-stim capture so the
+                    # DMD doesn't keep re-pulsing the last-loaded stim
+                    # pattern on every camera TTL under OverlapMode=On.
+                    # Stim events already carry their slm_image via the
+                    # build_slm callback above; only imaging / ref events
+                    # need the explicit all-on SLMImage. KeepDMDAlive's
+                    # 60 s refresh is too slow to catch the tight burst
+                    # of events at a stim timepoint under FOV batching.
+                    # Pre-refactor (before f26b54e) the all-on SLMImage
+                    # was emitted by Controller._queue_channels via the
+                    # now-dead _make_slm helper.
+                    if (
+                        needs_wake
+                        and ev.metadata.get("img_type") != ImgType.IMG_STIM
+                    ):
+                        ev = ev.model_copy(
+                            update={
+                                "slm_image": SLMImage(
+                                    data=True,
+                                    device=mic_dmd.name,
+                                    exposure=ev.exposure,
+                                )
+                            }
+                        )
                     self._put_event(ev)
 
                 if stim_mode == StimMode.PREVIOUS and rtm_event.has_stim:

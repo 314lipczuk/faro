@@ -840,12 +840,6 @@ class Controller:
                     and rtm_event.index.get("t", 0) == 0
                 )
 
-                mic_dmd = self._mic.dmd
-                needs_wake = (
-                    mic_dmd is not None
-                    and getattr(self._mic, "dmd_needs_to_be_waken", False)
-                )
-
                 # Defer stim-mask computation so imaging events reach
                 # the MDA queue first. plan_events returns a list, and
                 # build_slm blocks on get_stim_mask (up to 80 s). With
@@ -866,25 +860,6 @@ class Controller:
                             slm = self._build_stim_slm(rtm_event, stim_mode=stim_mode)
                         if slm is not None:
                             ev = ev.model_copy(update={"slm_image": slm})
-                    elif needs_wake:
-                        # Hold the DMD all-on for non-stim captures so
-                        # the DMD doesn't keep re-pulsing the last-
-                        # loaded stim pattern on every camera TTL under
-                        # OverlapMode=On. KeepDMDAlive's 60 s refresh
-                        # is too slow to catch the tight burst of
-                        # events at a stim timepoint under FOV
-                        # batching. Pre-refactor (before f26b54e) this
-                        # all-on SLMImage was emitted by
-                        # Controller._queue_channels.
-                        ev = ev.model_copy(
-                            update={
-                                "slm_image": SLMImage(
-                                    data=True,
-                                    device=mic_dmd.name,
-                                    exposure=ev.exposure,
-                                )
-                            }
-                        )
                     self._put_event(ev)
         finally:
             self._event_queue = None
@@ -1008,12 +983,6 @@ class Controller:
         return SLMImage(
             data=stim_mask, device=self._mic.dmd.name, exposure=stim_ch.exposure
         )
-
-    @staticmethod
-    def _make_slm(dmd, exposure, dmd_needs_to_be_waken) -> SLMImage | None:
-        if dmd is not None and dmd_needs_to_be_waken:
-            return SLMImage(data=True, device=dmd.name, exposure=exposure)
-        return None
 
     def _put_event(self, event: MDAEvent) -> None:
         """Queue an MDA event."""

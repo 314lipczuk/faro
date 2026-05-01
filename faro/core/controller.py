@@ -826,27 +826,38 @@ class Controller:
                     time.sleep(0.1)
                 self._n_channels = len(rtm_event.channels)
 
+                # In "previous" mode at t=0 there is no predecessor
+                # mask, so suppress the stim event entirely. Firing a
+                # blank mask would still activate the DMD (mirror
+                # bleed-through ~1% of nominal intensity), and omitting
+                # ``slm_image`` would leave the DMD in its previously-
+                # latched state. Per-FOV first-visit suppression is
+                # *not* needed: the pipeline always-computes in previous
+                # mode (commit ca69abc), so peek_at_frame finds the
+                # predecessor's mask for every t > 0.
+                suppress_stim = (
+                    stim_mode == "previous"
+                    and rtm_event.index.get("t", 0) == 0
+                )
+
+                mic_dmd = self._mic.dmd
+                needs_wake = (
+                    mic_dmd is not None
+                    and getattr(self._mic, "dmd_needs_to_be_waken", False)
+                )
+
                 # Defer stim-mask computation so imaging events reach
                 # the MDA queue first. plan_events returns a list, and
                 # build_slm blocks on get_stim_mask (up to 80 s). With
                 # the old code the imaging event sat un-queued while
                 # get_stim_mask waited for a pipeline mask that could
                 # never arrive — a deadlock that looked like a timeout.
-                #
-                # In "previous" mode at t=0 there is no predecessor
-                # mask, so suppress the stim event entirely. Firing a
-                # blank mask would still activate the DMD (mirror
-                # bleed-through can leak ~1% of nominal intensity), and
-                # omitting the ``slm_image`` leaves the DMD in its
-                # previously-latched state. Skipping the event is the
-                # only way to guarantee zero stim at t=0.
-                suppress = stim_mode == "previous" and rtm_event.index.get("t", 0) == 0
                 planned = rtm_event.plan_events(
                     stim_mode=stim_mode,
                     build_slm=None,
                     resolve_group=self._mic.resolve_group,
                     resolve_power=self._mic.resolve_power,
-                    suppress_stim=suppress,
+                    suppress_stim=suppress_stim,
                 )
                 slm = None
                 for ev in planned:
@@ -855,6 +866,25 @@ class Controller:
                             slm = self._build_stim_slm(rtm_event, stim_mode=stim_mode)
                         if slm is not None:
                             ev = ev.model_copy(update={"slm_image": slm})
+                    elif needs_wake:
+                        # Hold the DMD all-on for non-stim captures so
+                        # the DMD doesn't keep re-pulsing the last-
+                        # loaded stim pattern on every camera TTL under
+                        # OverlapMode=On. KeepDMDAlive's 60 s refresh
+                        # is too slow to catch the tight burst of
+                        # events at a stim timepoint under FOV
+                        # batching. Pre-refactor (before f26b54e) this
+                        # all-on SLMImage was emitted by
+                        # Controller._queue_channels.
+                        ev = ev.model_copy(
+                            update={
+                                "slm_image": SLMImage(
+                                    data=True,
+                                    device=mic_dmd.name,
+                                    exposure=ev.exposure,
+                                )
+                            }
+                        )
                     self._put_event(ev)
         finally:
             self._event_queue = None

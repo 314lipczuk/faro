@@ -276,6 +276,17 @@ class OmeZarrWriter:
         # Label arrays created lazily on first write (one array per label name)
         self._label_arrays: dict[str, object] = {}
         self._label_lock = threading.Lock()
+        # The pipeline runs in 4 worker threads + a storage thread; all of
+        # them call writer.write(). The OME-Zarr store is sharded across
+        # channels (one shard per (t, p), all channels packed in), so a
+        # write to one channel does a read-modify-write of the whole shard
+        # file. Concurrent writes to different channels of the same (t, p)
+        # — e.g. raw imaging from the storage thread and the stim channel
+        # from a pipeline worker — race on zarr's partial-shard atomic
+        # rename and surface as PermissionError [WinError 5] on Windows
+        # / Z: SMB shares. Serialize all .write() calls to keep the
+        # rename atomic per shard.
+        self._write_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Event persistence
@@ -542,14 +553,15 @@ class OmeZarrWriter:
     # ------------------------------------------------------------------
 
     def write(self, img: np.ndarray, metadata: dict, folder: str) -> None:
-        if folder == "raw":
-            self._write_raw(img, metadata)
-        elif folder == "stim":
-            self._write_stim(img, metadata)
-        elif folder == "ref":
-            self._tiff.write(img, metadata, folder)
-        else:
-            self._write_label(img, metadata, folder)
+        with self._write_lock:
+            if folder == "raw":
+                self._write_raw(img, metadata)
+            elif folder == "stim":
+                self._write_stim(img, metadata)
+            elif folder == "ref":
+                self._tiff.write(img, metadata, folder)
+            else:
+                self._write_label(img, metadata, folder)
 
     def close(self) -> None:
         if self._stream is not None:

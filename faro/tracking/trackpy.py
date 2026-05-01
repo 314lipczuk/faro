@@ -38,7 +38,22 @@ class TrackerTrackpy(Tracker):
         coordinates = np.array(
             df_new[["x", "y"]]
         )  # Convert the df to an array of shape (shape: N, ndim) for trackpy
-        if df_old.empty:  # this is the first frame
+
+        # First-frame init when either df_old is empty (true first frame for
+        # this FOV) or the linker hasn't been built yet (df_old recovered
+        # from the parquet file fallback after a get_predecessor timeout, or
+        # carried forward across early empty-detection frames). Without the
+        # linker check next_level below crashes with NoneType.next_level.
+        needs_init = df_old.empty or fov_state.linker is None
+        if needs_init:
+            if not df_old.empty and fov_state.linker is None:
+                print(
+                    f"[trackpy] linker is None but df_old has {len(df_old)} rows "
+                    "(likely a recovered/stale predecessor). Discarding df_old "
+                    "and starting a fresh linker for this FOV — particle IDs "
+                    "from earlier frames will not carry over."
+                )
+                df_old = pd.DataFrame()
             fov_state.linker = trackpy.linking.Linker(
                 search_range=self.search_range,
                 memory=self.memory,

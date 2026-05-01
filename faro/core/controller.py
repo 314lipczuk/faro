@@ -270,7 +270,18 @@ class Analyzer:
             self.writer.write(img, metadata, "stim")
 
         elif img_type == ImgType.IMG_REF:
-            self.writer.write(img, metadata, "ref")
+            # The bundled stack at a ref frame is [imaging | ref] (in
+            # that channel order — see RTMSequence.to_mda_events). Only
+            # the ref slice belongs in ref/ TIFF; the imaging slice goes
+            # to "raw" alongside other timepoints, otherwise the last
+            # frame in the main zarr is dark.
+            n_channels = len(metadata.get("channels", ()))
+            n_ref = len(metadata.get("ref_channels", ()))
+            if n_ref > 0 and img.ndim == 3 and img.shape[0] > n_channels:
+                self.writer.write(img[:n_channels], metadata, "raw")
+                self.writer.write(img[n_channels:], metadata, "ref")
+            else:
+                self.writer.write(img, metadata, "ref")
 
     def _put_stim_mask_if_no_labels(
         self,

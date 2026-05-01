@@ -469,17 +469,41 @@ class Analyzer:
                 f"[Analyzer] Pipeline task done (active={self.active_pipeline_tasks})"
             )
 
-    def shutdown(self, wait: bool = True):
+    def shutdown(self, wait: bool = True, *, drain_timeout: float = 300.0):
         """Shutdown storage thread, deferred thread, and pipeline executor.
 
-        Workers drain their queues before exiting, so setting ``_stop_event``
-        first and then joining the threads guarantees no queued items are lost.
+        With ``wait=True``: drain the storage / deferred / pipeline queues
+        first (workers still active), then signal stop, then join. The
+        drain has a finite ``drain_timeout`` (default 300 s); if that
+        elapses without the queues going idle, raises ``TimeoutError``
+        BEFORE any teardown, so the call is safe to retry — typically
+        with a larger ``drain_timeout`` after investigating
+        ``get_stats()``.
+
+        Without the up-front drain the storage thread could still be
+        pulling items and submitting pipeline tasks when the 30 s
+        join-timeout below fired, those late tasks would never reach the
+        executor, and ``finish_experiment`` would return before per-FOV
+        track parquets had been written — leaving
+        ``generate_exp_data_from_tracks`` to crash on an empty
+        ``tracks/`` with ``pd.concat([])``.
         """
+        if wait:
+            if not self.wait_idle(timeout=drain_timeout):
+                stats = self.get_stats()
+                raise TimeoutError(
+                    f"Analyzer.shutdown: queues did not drain within "
+                    f"{drain_timeout}s. State: {stats}. No teardown done — "
+                    "call shutdown(drain_timeout=N) again with a larger "
+                    "N if the experiment legitimately needs more time."
+                )
+
         self._stop_event.set()
 
         if wait:
-            # Workers drain remaining items before exiting, so joining
-            # the threads is sufficient (no queue.join() needed).
+            # Watchdog only — wait_idle above already proved the queues
+            # are empty, so the workers should exit on the next 0.5 s
+            # poll once they see _stop_event.
             self._storage_thread.join(timeout=30)
             self._deferred_thread.join(timeout=30)
 
@@ -488,15 +512,18 @@ class Analyzer:
         if self.writer is not None:
             self.writer.close()
 
-    def wait_idle(self, timeout: float = 30.0, poll: float = 0.05) -> bool:
+    def wait_idle(
+        self, timeout: float | None = 30.0, poll: float = 0.05
+    ) -> bool:
         """Block until storage, pipeline, and deferred queues all drain.
 
         Returns True if idle was reached before the timeout, False
-        otherwise. Used by tests and smoke scripts to flush in-flight
-        work before asserting on outputs, without a full ``shutdown``.
+        otherwise. Pass ``timeout=None`` to wait indefinitely (used by
+        ``shutdown(wait=True)`` so finish_experiment can't return while
+        per-FOV track parquets are still being written).
         """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while deadline is None or time.monotonic() < deadline:
             storage_empty = self._storage_queue.qsize() == 0
             deferred_empty = self._deferred_queue.qsize() == 0
             with self.task_lock:
@@ -723,16 +750,22 @@ class Controller:
         if offset_events:
             self._t_offset = max(e.index.get("t", 0) for e in offset_events) + 1
 
-    def finish_experiment(self):
+    def finish_experiment(self, *, drain_timeout: float = 300.0):
         """Shutdown the Analyzer and reset continuation state.
 
         Call after all ``run_experiment`` / ``continue_experiment`` calls
-        are done.
+        are done. ``drain_timeout`` (default 300 s) bounds how long
+        ``Analyzer.shutdown`` will wait for the storage / deferred /
+        pipeline queues to drain before raising ``TimeoutError``. On
+        timeout no teardown happens, so the call is safe to retry with
+        a larger value.
         """
         if self._analyzer is not None:
-            # Snapshot before we drop the Analyzer.
+            # shutdown is the gate — only snapshot background_errors and
+            # drop the Analyzer once it succeeds. On TimeoutError the
+            # Analyzer is still alive and the caller can retry.
+            self._analyzer.shutdown(wait=True, drain_timeout=drain_timeout)
             self.background_errors.extend(self._analyzer.background_errors)
-            self._analyzer.shutdown(wait=True)
             self._analyzer = None
         self._t_offset = 0
         self._time_offset = 0.0

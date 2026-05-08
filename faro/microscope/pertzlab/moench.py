@@ -2,6 +2,7 @@ import pymmcore_plus
 import weakref
 
 from faro.microscope.pymmcore import PyMMCoreMicroscope
+from faro.core.data_structures import ImgType
 from faro.core.dmd import DMD
 from faro.core._useq_compat import SLMImage
 from pymmcore_plus.mda._engine import MDAEngine
@@ -95,9 +96,14 @@ class Moench(PyMMCoreMicroscope):
         "property_name": "Cyan_Level",
         "power": 10,
     }
+    BINNING = "2x2"
+    # ROI: full width (no x crop), symmetric top-bottom crop to ROI_HEIGHT.
+    # ROI_X / ROI_Y / ROI_WIDTH are recomputed in set_roi() against the
+    # live camera dimensions so the values stay correct under any binning.
+    # Defaults below match Prime BSI (2048 unbinned -> 1024 with 2x2).
     ROI_X = 0
-    ROI_Y = 60
-    ROI_WIDTH = 800
+    ROI_Y = 112
+    ROI_WIDTH = 1024
     ROI_HEIGHT = 800
     SET_ROI_REQUIRED = True
 
@@ -126,6 +132,11 @@ class Moench(PyMMCoreMicroscope):
         """Initialize the microscope."""
         self.mmc.loadSystemConfiguration(self.MICROMANAGER_CONFIG)
         self.mmc.setConfig(groupName="System", configName="Startup")
+        # Pin camera binning before set_roi(): MM camera drivers reset
+        # the ROI on a binning change, so binning must come first.
+        self.mmc.setConfig("Binning", self.BINNING)
+        if self.SET_ROI_REQUIRED:
+            self.set_roi()
         self.register_engine()
 
         self.slm_dev = self.mmc.getSLMDevice()
@@ -167,7 +178,19 @@ class Moench(PyMMCoreMicroscope):
             self.wakeup_dmd.run()
 
     def set_roi(self):
+        """Apply full-width, symmetric top-bottom ROI of height ROI_HEIGHT.
+
+        Recomputes ROI_X / ROI_Y / ROI_WIDTH from the camera's live
+        full-frame dimensions under the active binning, then writes
+        them back to the instance so downstream callers reading
+        ``mic.ROI_*`` see the actual values in effect.
+        """
         self.mmc.clearROI()
+        full_w = self.mmc.getImageWidth()
+        full_h = self.mmc.getImageHeight()
+        self.ROI_X = 0
+        self.ROI_Y = max(0, (full_h - self.ROI_HEIGHT) // 2)
+        self.ROI_WIDTH = full_w
         self.mmc.setROI(self.ROI_X, self.ROI_Y, self.ROI_WIDTH, self.ROI_HEIGHT)
 
     def post_experiment(self):
@@ -418,6 +441,36 @@ class MoenchMDAEngine(MDAEngine):
                     f"target={target_xy}, actual={actual_xy}"
                 )
 
+    def setup_sequence(self, sequence):
+        """Pause KeepDMDAlive for the duration of the MDA.
+
+        The engine drives the DMD on every event (stim mask on stim
+        frames, all-on on imaging frames when
+        ``dmd_needs_to_be_waken``), so the 60 s background refresh is
+        redundant during a run and just adds SLM-device contention.
+        Restarted in ``teardown_sequence``.
+        """
+        mic = self.microscope
+        if mic is not None:
+            wakeup = getattr(mic, "wakeup_dmd", None)
+            if wakeup is not None:
+                try:
+                    wakeup.stop()
+                except Exception:
+                    self._log.exception("Failed to stop wakeup_dmd before MDA")
+        return super().setup_sequence(sequence)
+
+    def teardown_sequence(self, sequence) -> None:
+        super().teardown_sequence(sequence)
+        mic = self.microscope
+        if mic is not None:
+            wakeup = getattr(mic, "wakeup_dmd", None)
+            if wakeup is not None:
+                try:
+                    wakeup.run()
+                except Exception:
+                    self._log.exception("Failed to restart wakeup_dmd after MDA")
+
     def setup_event(self, event: MDAEvent) -> None:
         """Override to wait for devices individually, bypassing TIXYDrive.
 
@@ -426,12 +479,56 @@ class MoenchMDAEngine(MDAEngine):
         device individually and handle TIXYDrive separately only when an XY
         move was actually commanded.
         """
+        event = self._maybe_inject_dmd_wake_slm(event)
         if isinstance(event, SequencedEvent):
             self.setup_sequenced_event(event)
         else:
             self.setup_single_event(event)
 
         self._wait_for_system_excluding_xy(event)
+
+    def exec_event(self, event: MDAEvent):
+        """Override to inject the all-on SLM on non-stim events.
+
+        Must mirror ``setup_event``'s injection: ``MDARunner`` keeps its
+        own reference to the original event, so a ``model_copy`` inside
+        ``setup_event`` doesn't propagate. Without this override
+        ``_exec_event_slm_image`` (the ``displaySLMImage`` that arms the
+        pattern for the next camera TTL) never fires for non-stim
+        events, leaving the previously latched stim pattern to pulse
+        instead.
+        """
+        event = self._maybe_inject_dmd_wake_slm(event)
+        yield from super().exec_event(event)
+
+    def _maybe_inject_dmd_wake_slm(self, event: MDAEvent) -> MDAEvent:
+        """Hold the DMD all-on for non-stim captures.
+
+        Under OverlapMode=On the DMD re-pulses its currently loaded
+        pattern on every camera TTL. After a stim event the stim
+        pattern stays latched, so subsequent imaging events at the
+        same timepoint (e.g. other FOVs in an FOV-batched burst)
+        would pulse the stim pattern instead of an all-on frame and
+        come back dark. KeepDMDAlive's 60 s refresh is too slow to
+        catch that burst.
+        """
+        if event.slm_image is not None:
+            return event
+        mic = self.microscope
+        if mic is None or not getattr(mic, "dmd_needs_to_be_waken", False):
+            return event
+        dmd = getattr(mic, "dmd", None)
+        if dmd is None:
+            return event
+        if event.metadata.get("img_type") == ImgType.IMG_STIM:
+            return event
+        return event.model_copy(
+            update={
+                "slm_image": SLMImage(
+                    data=True, device=dmd.name, exposure=event.exposure
+                )
+            }
+        )
 
     def setup_single_event(self, event: MDAEvent) -> None:
         """Setup hardware for a single (non-sequenced) event.

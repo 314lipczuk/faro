@@ -270,7 +270,18 @@ class Analyzer:
             self.writer.write(img, metadata, "stim")
 
         elif img_type == ImgType.IMG_REF:
-            self.writer.write(img, metadata, "ref")
+            # The bundled stack at a ref frame is [imaging | ref] (in
+            # that channel order — see RTMSequence.to_mda_events). Only
+            # the ref slice belongs in ref/ TIFF; the imaging slice goes
+            # to "raw" alongside other timepoints, otherwise the last
+            # frame in the main zarr is dark.
+            n_channels = len(metadata.get("channels", ()))
+            n_ref = len(metadata.get("ref_channels", ()))
+            if n_ref > 0 and img.ndim == 3 and img.shape[0] > n_channels:
+                self.writer.write(img[:n_channels], metadata, "raw")
+                self.writer.write(img[n_channels:], metadata, "ref")
+            else:
+                self.writer.write(img, metadata, "ref")
 
     def _put_stim_mask_if_no_labels(
         self,
@@ -469,17 +480,41 @@ class Analyzer:
                 f"[Analyzer] Pipeline task done (active={self.active_pipeline_tasks})"
             )
 
-    def shutdown(self, wait: bool = True):
+    def shutdown(self, wait: bool = True, *, drain_timeout: float = 300.0):
         """Shutdown storage thread, deferred thread, and pipeline executor.
 
-        Workers drain their queues before exiting, so setting ``_stop_event``
-        first and then joining the threads guarantees no queued items are lost.
+        With ``wait=True``: drain the storage / deferred / pipeline queues
+        first (workers still active), then signal stop, then join. The
+        drain has a finite ``drain_timeout`` (default 300 s); if that
+        elapses without the queues going idle, raises ``TimeoutError``
+        BEFORE any teardown, so the call is safe to retry — typically
+        with a larger ``drain_timeout`` after investigating
+        ``get_stats()``.
+
+        Without the up-front drain the storage thread could still be
+        pulling items and submitting pipeline tasks when the 30 s
+        join-timeout below fired, those late tasks would never reach the
+        executor, and ``finish_experiment`` would return before per-FOV
+        track parquets had been written — leaving
+        ``generate_exp_data_from_tracks`` to crash on an empty
+        ``tracks/`` with ``pd.concat([])``.
         """
+        if wait:
+            if not self.wait_idle(timeout=drain_timeout):
+                stats = self.get_stats()
+                raise TimeoutError(
+                    f"Analyzer.shutdown: queues did not drain within "
+                    f"{drain_timeout}s. State: {stats}. No teardown done — "
+                    "call shutdown(drain_timeout=N) again with a larger "
+                    "N if the experiment legitimately needs more time."
+                )
+
         self._stop_event.set()
 
         if wait:
-            # Workers drain remaining items before exiting, so joining
-            # the threads is sufficient (no queue.join() needed).
+            # Watchdog only — wait_idle above already proved the queues
+            # are empty, so the workers should exit on the next 0.5 s
+            # poll once they see _stop_event.
             self._storage_thread.join(timeout=30)
             self._deferred_thread.join(timeout=30)
 
@@ -487,6 +522,27 @@ class Analyzer:
 
         if self.writer is not None:
             self.writer.close()
+
+    def wait_idle(
+        self, timeout: float | None = 30.0, poll: float = 0.05
+    ) -> bool:
+        """Block until storage, pipeline, and deferred queues all drain.
+
+        Returns True if idle was reached before the timeout, False
+        otherwise. Pass ``timeout=None`` to wait indefinitely (used by
+        ``shutdown(wait=True)`` so finish_experiment can't return while
+        per-FOV track parquets are still being written).
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while deadline is None or time.monotonic() < deadline:
+            storage_empty = self._storage_queue.qsize() == 0
+            deferred_empty = self._deferred_queue.qsize() == 0
+            with self.task_lock:
+                pipeline_idle = self.active_pipeline_tasks == 0
+            if storage_empty and deferred_empty and pipeline_idle:
+                return True
+            time.sleep(poll)
+        return False
 
     def get_stats(self) -> dict:
         """Get analyzer statistics."""
@@ -705,16 +761,22 @@ class Controller:
         if offset_events:
             self._t_offset = max(e.index.get("t", 0) for e in offset_events) + 1
 
-    def finish_experiment(self):
+    def finish_experiment(self, *, drain_timeout: float = 300.0):
         """Shutdown the Analyzer and reset continuation state.
 
         Call after all ``run_experiment`` / ``continue_experiment`` calls
-        are done.
+        are done. ``drain_timeout`` (default 300 s) bounds how long
+        ``Analyzer.shutdown`` will wait for the storage / deferred /
+        pipeline queues to drain before raising ``TimeoutError``. On
+        timeout no teardown happens, so the call is safe to retry with
+        a larger value.
         """
         if self._analyzer is not None:
-            # Snapshot before we drop the Analyzer.
+            # shutdown is the gate — only snapshot background_errors and
+            # drop the Analyzer once it succeeds. On TimeoutError the
+            # Analyzer is still alive and the caller can retry.
+            self._analyzer.shutdown(wait=True, drain_timeout=drain_timeout)
             self.background_errors.extend(self._analyzer.background_errors)
-            self._analyzer.shutdown(wait=True)
             self._analyzer = None
         self._t_offset = 0
         self._time_offset = 0.0
@@ -808,27 +870,32 @@ class Controller:
                     time.sleep(0.1)
                 self._n_channels = len(rtm_event.channels)
 
+                # In "previous" mode at t=0 there is no predecessor
+                # mask, so suppress the stim event entirely. Firing a
+                # blank mask would still activate the DMD (mirror
+                # bleed-through ~1% of nominal intensity), and omitting
+                # ``slm_image`` would leave the DMD in its previously-
+                # latched state. Per-FOV first-visit suppression is
+                # *not* needed: the pipeline always-computes in previous
+                # mode (commit ca69abc), so peek_at_frame finds the
+                # predecessor's mask for every t > 0.
+                suppress_stim = (
+                    stim_mode == "previous"
+                    and rtm_event.index.get("t", 0) == 0
+                )
+
                 # Defer stim-mask computation so imaging events reach
                 # the MDA queue first. plan_events returns a list, and
                 # build_slm blocks on get_stim_mask (up to 80 s). With
                 # the old code the imaging event sat un-queued while
                 # get_stim_mask waited for a pipeline mask that could
                 # never arrive — a deadlock that looked like a timeout.
-                #
-                # In "previous" mode at t=0 there is no predecessor
-                # mask, so suppress the stim event entirely. Firing a
-                # blank mask would still activate the DMD (mirror
-                # bleed-through can leak ~1% of nominal intensity), and
-                # omitting the ``slm_image`` leaves the DMD in its
-                # previously-latched state. Skipping the event is the
-                # only way to guarantee zero stim at t=0.
-                suppress = stim_mode == "previous" and rtm_event.index.get("t", 0) == 0
                 planned = rtm_event.plan_events(
                     stim_mode=stim_mode,
                     build_slm=None,
                     resolve_group=self._mic.resolve_group,
                     resolve_power=self._mic.resolve_power,
-                    suppress_stim=suppress,
+                    suppress_stim=suppress_stim,
                 )
                 slm = None
                 for ev in planned:
@@ -960,12 +1027,6 @@ class Controller:
         return SLMImage(
             data=stim_mask, device=self._mic.dmd.name, exposure=stim_ch.exposure
         )
-
-    @staticmethod
-    def _make_slm(dmd, exposure, dmd_needs_to_be_waken) -> SLMImage | None:
-        if dmd is not None and dmd_needs_to_be_waken:
-            return SLMImage(data=True, device=dmd.name, exposure=exposure)
-        return None
 
     def _put_event(self, event: MDAEvent) -> None:
         """Queue an MDA event."""

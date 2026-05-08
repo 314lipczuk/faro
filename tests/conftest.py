@@ -1,44 +1,44 @@
-"""Top-level pytest configuration + shared test helpers for the faro suite.
+"""Top-level pytest configuration for the faro test suite.
 
-Hosts:
+Hosts the ``--scope`` CLI option used by hardware-in-the-loop tests so
+that the option is recognized regardless of which subdirectory of
+``tests/`` is being collected. Hardware tests live under
+``tests/hardware/`` and are gated as follows:
 
-- The ``--scope`` CLI option used by hardware-in-the-loop tests so that the
-  option is recognized regardless of which subdirectory of ``tests/`` is
-  being collected. Hardware tests live under ``tests/hardware/`` and are
-  gated as follows:
-
-  - ``pytest`` (no flag, no env var): hardware tests are collected but
-    auto-skipped. CI-safe by default.
-  - ``pytest --scope moench|niesen|jungfrau``: hardware tests run against
-    the selected Pertzlab microscope.
-  - ``FARO_SCOPE=moench pytest``: same effect via env var (useful for CI
-    runners that pre-configure the target scope).
-
-- Shared fixtures/helpers importable by any test (e.g. :class:`FakeDMD`).
+- ``pytest`` (no flag, no env var): hardware tests are collected but
+  auto-skipped. CI-safe by default.
+- ``pytest --scope moench|niesen|jungfrau``: hardware tests run against
+  the selected Pertzlab microscope.
+- ``FARO_SCOPE=moench pytest``: same effect via env var (useful for CI
+  runners that pre-configure the target scope).
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
+import tempfile
 
 import pytest
 
+# motile v0.4 emits a DEBUG record per variable with a ``%.3f`` format
+# that blows up when pytest captures DEBUG (some numpy scalar subclasses
+# do not implement __float__ cleanly in logging's lazy formatter).
+# Silencing at INFO keeps the underlying solve intact.
+logging.getLogger("motile").setLevel(logging.INFO)
 
-class FakeDMD:
-    """Minimal stand-in for an SLM/DMD device.
 
-    Real ``faro.core.dmd.DMD`` wraps a micro-manager device and requires
-    calibration. Tests that need to exercise the controller's stim-event
-    branch (``if self._mic.dmd:``) can attach this to a microscope
-    instead. The ``affine_transform`` is identity so test assertions can
-    compare the delivered SLM data against the mask produced by the
-    stimulator directly.
+@pytest.fixture()
+def tmp_dir():
+    """String tempdir cleaned up on teardown.
+
+    Most faro storage APIs take ``str`` paths, so this fixture exists
+    alongside pytest's built-in ``tmp_path`` (which yields ``pathlib.Path``).
     """
-
-    name = "FakeDMD"
-
-    def affine_transform(self, img):
-        return img
+    path = tempfile.mkdtemp()
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def resolve_scope(config: pytest.Config) -> str | None:

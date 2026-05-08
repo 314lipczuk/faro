@@ -1,53 +1,41 @@
-"""End-to-end pipeline integration tests.
+"""Core end-to-end pipeline integration tests.
 
-Uses a fake CircleMicroscope (no pymmcore dependency) that generates
-synthetic images with two bright circles at known positions.
+Drives the Controller → Pipeline stack through :class:`FakeMicroscope`
+with :class:`CircleScene`. No pymmcore-plus install required; all
+acquisition flow goes through the fake mmc's MDA signal chain.
+
+Covers the happy-path end-to-end run and the continue/extend
+experiment lifecycle. Stim-mode tests live in
+:mod:`tests.test_pipeline_stim`; failure/crash/stress/burst tests
+live in :mod:`tests.test_pipeline_failures`.
 """
 
 from __future__ import annotations
 
 import math
 import os
-import shutil
-import tempfile
-import threading
-import time
-from collections.abc import Iterator
 
 import numpy as np
 import pandas as pd
 import pytest
 import tifffile
-from useq import MDAEvent
-from useq._mda_event import SLMImage
 
-from faro.core.controller import Analyzer, Controller
-from faro.core.data_structures import (
-    Channel,
-    FovState,
-    ImgType,
-    RTMEvent,
-    SegmentationMethod,
+from faro.core.controller import Controller
+
+from tests.fake_microscope import FakeMicroscope
+from tests.fixtures import (
+    CIRCLE1_CENTER,
+    CIRCLE1_RADIUS,
+    CIRCLE2_CENTER,
+    CIRCLE2_RADIUS,
+    CircleScene,
+    assert_no_background_errors,
+    make_events,
+    run_and_wait,
+    tracker,  # noqa: F401 — parametrized fixture, auto-discovered by pytest
 )
-from faro.core.pipeline import ImageProcessingPipeline
-from faro.feature_extraction.simple import SimpleFE
-from faro.microscope.base import AbstractMicroscope
-from faro.segmentation.base import OtsuSegmentator
-from faro.stimulation.base import Stim, StimWithImage, StimWithPipeline, StimWholeFOV
-from faro.stimulation.center_circle import CenterCircle
-from faro.tracking.trackpy import TrackerTrackpy
+from tests.fixtures import make_pipeline as _make_pipeline
 
-from .conftest import FakeDMD
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-IMG_SIZE = 256
-CIRCLE1_CENTER = (64, 64)  # (row, col)
-CIRCLE1_RADIUS = 20
-CIRCLE2_CENTER = (192, 192)
-CIRCLE2_RADIUS = 15
 
 EXPECTED_AREA_1 = math.pi * CIRCLE1_RADIUS**2  # ~1257
 EXPECTED_AREA_2 = math.pi * CIRCLE2_RADIUS**2  # ~707
@@ -55,242 +43,6 @@ EXPECTED_AREA_2 = math.pi * CIRCLE2_RADIUS**2  # ~707
 N_TIMEPOINTS = 5
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def make_circle_image() -> np.ndarray:
-    """Generate a 256x256 uint16 image with two bright circles."""
-    img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint16)
-    y, x = np.ogrid[:IMG_SIZE, :IMG_SIZE]
-
-    mask1 = (y - CIRCLE1_CENTER[0]) ** 2 + (
-        x - CIRCLE1_CENTER[1]
-    ) ** 2 <= CIRCLE1_RADIUS**2
-    mask2 = (y - CIRCLE2_CENTER[0]) ** 2 + (
-        x - CIRCLE2_CENTER[1]
-    ) ** 2 <= CIRCLE2_RADIUS**2
-
-    img[mask1] = 50000
-    img[mask2] = 50000
-    return img
-
-
-def make_events(n_timepoints: int, *, stim_frames=()) -> list[RTMEvent]:
-    """Create a list of RTMEvents for testing."""
-    stim_set = set(stim_frames)
-    stim_ch = (Channel(config="stim-405", exposure=100),)
-    events = []
-    for t in range(n_timepoints):
-        has_stim = t in stim_set
-        events.append(
-            RTMEvent(
-                index={"t": t, "p": 0},
-                channels=(Channel(config="phase-contrast", exposure=50),),
-                stim_channels=stim_ch if has_stim else (),
-                metadata={},
-            )
-        )
-    return events
-
-
-# ---------------------------------------------------------------------------
-# CircleMicroscope — fake microscope for testing
-# ---------------------------------------------------------------------------
-
-
-class CircleMicroscope(AbstractMicroscope):
-    """Fake microscope that generates synthetic circle images.
-
-    No pymmcore dependency. Fires callbacks from a daemon thread.
-
-    Args:
-        dmd: Optional DMD stand-in (see ``tests.conftest.FakeDMD``). When
-            set, the controller's stim-event branch
-            (``if self._mic.dmd:``) is taken and ``_build_stim_slm`` runs,
-            allowing end-to-end stim-mask-selection tests. SLM images
-            delivered to stim events are recorded in :attr:`slm_events`
-            as ``(frame_idx, SLMImage)`` tuples.
-        blank_frames: Timepoints for which the microscope returns an
-            all-zero frame instead of circles (for testing no-cell edge
-            cases).
-    """
-
-    def __init__(self, dmd=None, blank_frames: set[int] = frozenset()):
-        super().__init__()
-        self._blank_frames = blank_frames
-        self._callback = None
-        self._cancel = threading.Event()
-        self.dmd = dmd
-        self.slm_events: list[tuple[int, SLMImage]] = []
-
-    def connect_frame(self, callback):
-        self._callback = callback
-
-    def disconnect_frame(self, callback):
-        if self._callback is callback:
-            self._callback = None
-
-    def run_mda(self, event_iter: Iterator[MDAEvent]) -> threading.Thread:
-        self._cancel.clear()
-
-        def _run():
-            for event in event_iter:
-                if self._cancel.is_set():
-                    break
-                t = event.index.get("t", 0)
-                if getattr(event, "slm_image", None) is not None:
-                    self.slm_events.append((t, event.slm_image))
-                img = (
-                    np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint16)
-                    if t in self._blank_frames
-                    else make_circle_image()
-                )
-                if self._callback is not None:
-                    self._callback(img, event)
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        return thread
-
-    def cancel_mda(self):
-        self._cancel.set()
-
-
-# ---------------------------------------------------------------------------
-# run_and_wait helper
-# ---------------------------------------------------------------------------
-
-
-def assert_no_background_errors(ctrl: Controller) -> None:
-    """Fail with a readable message if any background errors were recorded."""
-    if ctrl.background_errors:
-        summary = "\n".join(
-            f"  [{e.source}] {e.exc_type}: {e.message}" for e in ctrl.background_errors
-        )
-        raise AssertionError(f"Background errors during acquisition:\n{summary}")
-
-
-def run_and_wait(ctrl: Controller, events: list[RTMEvent], stim_mode: str = "current"):
-    """Run an experiment and block until all pipeline work finishes."""
-    ctrl.run_experiment(events, stim_mode=stim_mode, validate=False)
-
-    analyzer = ctrl._analyzer
-    # Poll until storage and pipeline are drained
-    deadline = time.monotonic() + 30  # 30s timeout
-    while time.monotonic() < deadline:
-        storage_empty = analyzer._storage_queue.qsize() == 0
-        with analyzer.task_lock:
-            pipeline_idle = analyzer.active_pipeline_tasks == 0
-        deferred_empty = analyzer._deferred_queue.qsize() == 0
-        if storage_empty and pipeline_idle and deferred_empty:
-            break
-        time.sleep(0.1)
-
-    analyzer.shutdown(wait=True)
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def tmp_dir():
-    path = tempfile.mkdtemp()
-    yield path
-    shutil.rmtree(path, ignore_errors=True)
-
-
-def _make_pipeline(path, *, with_stim=False):
-    """Build a pipeline with real components for integration testing."""
-    return ImageProcessingPipeline(
-        storage_path=path,
-        segmentators=[SegmentationMethod("labels", OtsuSegmentator(), 0, False)],
-        tracker=TrackerTrackpy(search_range=50, memory=3),
-        feature_extractor=SimpleFE("labels"),
-        stimulator=CenterCircle() if with_stim else None,
-    )
-
-
-# ===================================================================
-# Test Class 1: Pipeline component sanity checks
-# ===================================================================
-
-
-class TestPipelineComponents:
-    """Unit-level sanity checks for pipeline components on circle images."""
-
-    def test_otsu_segments_two_circles(self):
-        img = make_circle_image()
-        seg = OtsuSegmentator()
-        labels = seg.segment(img)
-        unique_labels = set(np.unique(labels)) - {0}
-        assert len(unique_labels) == 2, f"Expected 2 labels, got {len(unique_labels)}"
-
-    def test_otsu_labels_have_correct_area(self):
-        img = make_circle_image()
-        seg = OtsuSegmentator()
-        labels = seg.segment(img)
-        from skimage.measure import regionprops
-
-        props = regionprops(labels)
-        areas = sorted([p.area for p in props])
-        # Smaller circle: r=15, expected ~707
-        assert (
-            abs(areas[0] - EXPECTED_AREA_2) < 10
-        ), f"Small circle area {areas[0]} not ~{EXPECTED_AREA_2}"
-        # Larger circle: r=20, expected ~1257
-        assert (
-            abs(areas[1] - EXPECTED_AREA_1) < 10
-        ), f"Large circle area {areas[1]} not ~{EXPECTED_AREA_1}"
-
-    def test_simple_fe_extracts_area(self):
-        img = make_circle_image()
-        seg = OtsuSegmentator()
-        labels = seg.segment(img)
-        fe = SimpleFE("labels")
-        df, _ = fe.extract_features({"labels": labels}, img[np.newaxis, ...])
-        assert "label" in df.columns
-        assert "area" in df.columns
-        assert len(df) == 2
-
-    def test_simple_fe_extracts_positions(self):
-        img = make_circle_image()
-        seg = OtsuSegmentator()
-        labels = seg.segment(img)
-        fe = SimpleFE("labels")
-        df = fe.extract_positions({"labels": labels})
-        assert set(df.columns) >= {"label", "x", "y"}
-        assert len(df) == 2
-        # Check centroids are near expected positions
-        centroids = df.sort_values("label")[["x", "y"]].values
-        assert abs(centroids[0][0] - CIRCLE1_CENTER[0]) < 1
-        assert abs(centroids[0][1] - CIRCLE1_CENTER[1]) < 1
-        assert abs(centroids[1][0] - CIRCLE2_CENTER[0]) < 1
-        assert abs(centroids[1][1] - CIRCLE2_CENTER[1]) < 1
-
-    def test_trackpy_links_across_frames(self):
-        img = make_circle_image()
-        seg = OtsuSegmentator()
-        labels = seg.segment(img)
-        fe = SimpleFE("labels")
-        tracker = TrackerTrackpy(search_range=50, memory=3)
-        fov_state = FovState()
-
-        df_tracked = pd.DataFrame()
-        for _ in range(3):
-            df_new = fe.extract_positions({"labels": labels})
-            df_tracked = tracker.track_cells(df_tracked, df_new, fov_state)
-            fov_state.fov_timestep_counter += 1
-
-        particles = df_tracked["particle"].unique()
-        assert len(particles) == 2, f"Expected 2 particles, got {len(particles)}"
-        # Each particle should appear in 3 timepoints
-        for pid in particles:
-            count = len(df_tracked[df_tracked["particle"] == pid])
-            assert count == 3, f"Particle {pid} has {count} entries, expected 3"
 
 
 # ===================================================================
@@ -302,10 +54,10 @@ class TestEndToEndNoStim:
     """5 timepoints, no stimulation — full Controller → Microscope → Pipeline loop."""
 
     @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
+    def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline(self.path, with_stim=False)
-        self.mic = CircleMicroscope()
+        self.pipeline = _make_pipeline(self.path, tracker=tracker, with_stim=False)
+        self.mic = FakeMicroscope(CircleScene())
         self.ctrl = Controller(self.mic, self.pipeline)
         self.events = make_events(N_TIMEPOINTS)
         run_and_wait(self.ctrl, self.events)
@@ -377,1002 +129,22 @@ class TestEndToEndNoStim:
         assert abs(positions[1][1] - CIRCLE2_CENTER[1]) < 1
 
 
-# ===================================================================
-# Test Class 3: End-to-end, stim mode="current"
-# ===================================================================
-
-
-class TestEndToEndStimCurrent:
-    """5 timepoints, stim on frames 2-4, mode='current'."""
-
-    STIM_FRAMES = (2, 3, 4)
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline(self.path, with_stim=True)
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_TIMEPOINTS, stim_frames=self.STIM_FRAMES)
-        run_and_wait(self.ctrl, self.events, stim_mode="current")
-
-    def test_stim_masks_saved(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = [f for f in os.listdir(stim_dir) if f.endswith(".tiff")]
-        assert (
-            len(files) == N_TIMEPOINTS
-        ), f"Expected {N_TIMEPOINTS} stim mask TIFFs, got {len(files)}"
-
-    def test_stim_masks_nonzero_for_stim_frames(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = sorted(os.listdir(stim_dir))
-        for i, f in enumerate(files):
-            mask = tifffile.imread(os.path.join(stim_dir, f))
-            if i in self.STIM_FRAMES:
-                assert mask.max() > 0, f"Frame {i} should have nonzero stim mask"
-            else:
-                assert mask.max() == 0, f"Frame {i} should have zero stim mask"
-
-    def test_segmentation_still_correct(self):
-        labels_dir = os.path.join(self.path, "labels")
-        files = sorted([f for f in os.listdir(labels_dir) if f.endswith(".tiff")])
-        assert len(files) == N_TIMEPOINTS
-        for f in files:
-            labels = tifffile.imread(os.path.join(labels_dir, f))
-            unique = set(np.unique(labels)) - {0}
-            assert len(unique) == 2, f"{f}: expected 2 labels, got {len(unique)}"
-
-
-# ===================================================================
-# Test Class 4: End-to-end, stim mode="previous"
-# ===================================================================
-
-
-class TestEndToEndStimPrevious:
-    """5 timepoints, stim on frames 2-4, mode='previous'."""
-
-    STIM_FRAMES = (2, 3, 4)
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline(self.path, with_stim=True)
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_TIMEPOINTS, stim_frames=self.STIM_FRAMES)
-        run_and_wait(self.ctrl, self.events, stim_mode="previous")
-
-    def test_stim_masks_produced(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        assert os.path.isdir(stim_dir)
-        files = [f for f in os.listdir(stim_dir) if f.endswith(".tiff")]
-        assert (
-            len(files) == N_TIMEPOINTS
-        ), f"Expected {N_TIMEPOINTS} stim mask files, got {len(files)}"
-
-    def test_segmentation_works(self):
-        labels_dir = os.path.join(self.path, "labels")
-        files = [f for f in os.listdir(labels_dir) if f.endswith(".tiff")]
-        assert len(files) == N_TIMEPOINTS
-
-    def test_tracking_consistent(self):
-        tracks_dir = os.path.join(self.path, "tracks")
-        parquet_files = [f for f in os.listdir(tracks_dir) if f.endswith(".parquet")]
-        assert len(parquet_files) >= 1
-        df = pd.read_parquet(os.path.join(tracks_dir, parquet_files[0]))
-        particles = df["particle"].unique()
-        assert len(particles) == 2, f"Expected 2 particles, got {len(particles)}"
-        for pid in particles:
-            rows = df[df["particle"] == pid]
-            assert len(rows) == N_TIMEPOINTS
-
-
-# ===================================================================
-# Test stimulators for shortcut-path testing
-# ===================================================================
-
-
-class MetadataOnlyStim(Stim):
-    """Base Stim — returns all-ones mask using only metadata["img_shape"]."""
-
-    def get_stim_mask(self, metadata: dict):
-        h, w = metadata["img_shape"]
-        return np.ones((h, w), dtype=np.uint8), None
-
-
-class ImageBasedStim(StimWithImage):
-    """StimWithImage — thresholds the raw image to build a stim mask."""
-
-    def get_stim_mask(self, metadata: dict, img: np.ndarray):
-        # Use first channel, threshold at half-max
-        frame = img[0] if img.ndim == 3 else img
-        thresh = frame.max() / 2
-        mask = (frame > thresh).astype(np.uint8)
-        return mask, None
-
-
-class _FrameTaggingStim(StimWithPipeline):
-    """StimWithPipeline that returns a mask whose pixel value = current timestep.
-
-    Used by :class:`TestStimModeMaskSelectionCurrent` /
-    :class:`TestStimModeMaskSelectionPrevious` so the SLM image delivered
-    to each stim event can be traced back to the frame that produced it.
-    """
-
-    required_metadata: set[str] = {"img_shape", "timestep"}
-
-    def get_stim_mask(
-        self,
-        *,
-        label_images,
-        metadata: dict,
-        img=None,
-        tracks=None,
-    ):
-        h, w = metadata["img_shape"]
-        t = metadata["timestep"]
-        return np.full((h, w), t, dtype=np.uint8), None
-
-
-def _sole_mask_value(slm_image: SLMImage) -> int:
-    """Return the single tag value of a _FrameTaggingStim mask.
-
-    ``_FrameTaggingStim`` fills the whole mask with ``metadata["timestep"]``,
-    so every pixel is equal. Assert that invariant and return the value.
-    """
-    assert isinstance(slm_image.data, np.ndarray)
-    unique = np.unique(slm_image.data)
-    assert unique.size == 1, f"expected uniform mask, got values {unique}"
-    return int(unique.item())
-
-
-def _make_pipeline_with_stim(path, stimulator):
-    """Build a pipeline with a specific stimulator for shortcut testing."""
-    return ImageProcessingPipeline(
-        storage_path=path,
-        segmentators=[SegmentationMethod("labels", OtsuSegmentator(), 0, False)],
-        tracker=TrackerTrackpy(search_range=50, memory=3),
-        feature_extractor=SimpleFE("labels"),
-        stimulator=stimulator,
-    )
-
-
-# ===================================================================
-# End-to-end stim-mode mask-selection tests (CircleMicroscope + FakeDMD)
-#
-# These classes actually exercise Controller._build_stim_slm and the
-# stim_mask_queue consumer by giving CircleMicroscope a DMD. The
-# _FrameTaggingStim returns a mask whose pixel value = the frame that
-# produced it, so asserting on CircleMicroscope.slm_events gives a
-# direct "event at frame t received mask from frame X" check.
-# ===================================================================
-
-
-class TestStimModeMaskSelectionCurrent:
-    """``current`` mode: stim at frame t must receive frame t's mask."""
-
-    STIM_FRAMES = (2, 3, 4)
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, _FrameTaggingStim())
-        self.mic = CircleMicroscope(dmd=FakeDMD())
-        self.ctrl = Controller(self.mic, self.pipeline)
-        events = make_events(N_TIMEPOINTS, stim_frames=self.STIM_FRAMES)
-        run_and_wait(self.ctrl, events, stim_mode="current")
-
-    def test_stim_events_received_correct_masks(self):
-        # One SLM image per stim event; each carries its own frame's mask.
-        assert len(self.mic.slm_events) == len(self.STIM_FRAMES)
-        for (event_t, slm_image), expected in zip(
-            self.mic.slm_events, self.STIM_FRAMES
-        ):
-            assert event_t == expected
-            assert _sole_mask_value(slm_image) == expected, (
-                f"Frame {event_t} received mask tagged "
-                f"{_sole_mask_value(slm_image)}, expected {expected}"
-            )
-
-
-class TestStimModeMaskSelectionPrevious:
-    """``previous`` mode: stim at frame t must receive frame t-1's mask.
-
-    The first stim frame (frame 2) does not actually fire — the controller's
-    ``_stim_pending`` guard skips it because no previous stim frame exists
-    for this FOV yet — so SLM events land on frames 3, 4 with masks from
-    frames 2, 3 respectively.
-    """
-
-    STIM_FRAMES = (2, 3, 4)
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, _FrameTaggingStim())
-        self.mic = CircleMicroscope(dmd=FakeDMD())
-        self.ctrl = Controller(self.mic, self.pipeline)
-        events = make_events(N_TIMEPOINTS, stim_frames=self.STIM_FRAMES)
-        run_and_wait(self.ctrl, events, stim_mode="previous")
-
-    def test_all_stim_events_fire_with_predecessor_mask(self):
-        """Every stim event fires, including the first — the pipeline always
-        computes a mask in previous mode, even for non-stim frames, so the
-        first stim frame's t-1 peek finds the prior computed mask.
-        """
-        # Event frame → mask source frame under "previous" semantics.
-        expected = [(2, 1), (3, 2), (4, 3)]
-        assert len(self.mic.slm_events) == len(expected)
-        for (event_t, slm_image), (exp_event, exp_mask) in zip(
-            self.mic.slm_events, expected
-        ):
-            assert event_t == exp_event
-            assert _sole_mask_value(slm_image) == exp_mask, (
-                f"Stim event at frame {event_t} received mask from frame "
-                f"{_sole_mask_value(slm_image)}, expected {exp_mask} "
-                f"(previous-frame semantics)"
-            )
-
-
-class TestStimModeCurrentAtFrameZero:
-    """Symmetric edge case to ``previous`` at frame 0: ``current`` at t=0 must
-    work (stim fires after t=0's own pipeline finishes and puts mask_0).
-    """
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, _FrameTaggingStim())
-        self.mic = CircleMicroscope(dmd=FakeDMD())
-        self.ctrl = Controller(self.mic, self.pipeline)
-        events = make_events(3, stim_frames=(0,))
-        run_and_wait(self.ctrl, events, stim_mode="current")
-
-    def test_frame_zero_stim_fires_with_own_mask(self):
-        assert len(self.mic.slm_events) == 1
-        event_t, slm_image = self.mic.slm_events[0]
-        assert event_t == 0
-        assert _sole_mask_value(slm_image) == 0
-
-
-def _make_multi_fov_events(
-    n_timepoints: int, *, stim_frames_per_fov: dict[int, tuple[int, ...]]
-) -> list[RTMEvent]:
-    """Build events interleaved across multiple FOVs.
-
-    ``stim_frames_per_fov`` maps ``fov_index`` → set of timepoints that carry
-    a stim channel for that FOV. Events are ordered by ``(t, p)``.
-    """
-    stim_ch = (Channel(config="stim-405", exposure=100),)
-    events = []
-    for t in range(n_timepoints):
-        for fov in sorted(stim_frames_per_fov):
-            has_stim = t in stim_frames_per_fov[fov]
-            events.append(
-                RTMEvent(
-                    index={"t": t, "p": fov},
-                    channels=(Channel(config="phase-contrast", exposure=50),),
-                    stim_channels=stim_ch if has_stim else (),
-                    metadata={},
-                )
-            )
-    return events
-
-
-class TestStimModePreviousMultiFov:
-    """Each FOV maintains independent dispenser state, so stim events in FOV 1
-    must never consume a mask produced by FOV 0 (or vice versa). With
-    always-compute, every stim event fires — including the first one on each
-    FOV.
-    """
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, _FrameTaggingStim())
-        self.mic = CircleMicroscope(dmd=FakeDMD())
-        self.ctrl = Controller(self.mic, self.pipeline)
-        # FOV 0: stim on frames (2, 3, 4); FOV 1: stim on frames (3, 4).
-        events = _make_multi_fov_events(
-            5, stim_frames_per_fov={0: (2, 3, 4), 1: (3, 4)}
-        )
-        run_and_wait(self.ctrl, events, stim_mode="previous")
-
-    def test_each_fov_uses_its_own_previous_mask(self):
-        # _FrameTaggingStim tags by timestep only, and each FOV has its own
-        # dispenser. FOV 0 fires on t=(2,3,4) with masks from (1,2,3); FOV 1
-        # fires on t=(3,4) with masks from (2,3).
-        events_by_tag = sorted(
-            (t, _sole_mask_value(slm)) for t, slm in self.mic.slm_events
-        )
-        assert events_by_tag == [(2, 1), (3, 2), (3, 2), (4, 3), (4, 3)]
-
-
-class TestStimModePreviousAtFrameZero:
-    """Edge case: ``previous`` mode at frame 0 has no t-1.
-
-    The controller passes ``suppress_stim=True`` to ``plan_events`` when
-    ``stim_mode == "previous"`` and ``t == 0``, so the stim event is
-    never queued. Firing a blank mask would still activate the DMD
-    (mirror bleed-through leaks ~1% of nominal intensity), so outright
-    suppression is the only way to guarantee zero stim at t=0.
-    """
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, MetadataOnlyStim())
-        self.mic = CircleMicroscope(dmd=FakeDMD())
-        self.ctrl = Controller(self.mic, self.pipeline)
-        events = make_events(2, stim_frames=(0,))
-        run_and_wait(self.ctrl, events, stim_mode="previous")
-
-    def test_no_stim_at_frame_0(self):
-        assert self.mic.slm_events == []
-
-
-class TestStimModePreviousPipelineCrashDoesNotDeadlock:
-    """If frame t's pipeline crashes inside the stim branch, the try/finally
-    must call ``skip_frame`` on stim_mask_queue so frame t+1's "previous"-mode
-    consumer sees a skipped predecessor (None) rather than blocking until
-    the 80 s timeout. Reuses the existing ``CrashingStimulator``.
-    """
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, CrashingStimulator())
-        self.mic = CircleMicroscope(dmd=FakeDMD())
-        self.ctrl = Controller(self.mic, self.pipeline)
-        events = make_events(4, stim_frames=(2, 3))
-        run_and_wait(self.ctrl, events, stim_mode="previous")
-
-    def test_all_stim_events_gracefully_fall_back(self):
-        # CrashingStimulator crashes on every call — including the always-
-        # compute path on non-stim frames. So every frame's pipeline skips
-        # the dispenser, and every stim event's t-1 peek returns None →
-        # SLMImage(data=False). Neither frame's stim actually fires, but
-        # neither deadlocks either.
-        assert len(self.mic.slm_events) == 2
-        for event_t, slm in self.mic.slm_events:
-            assert event_t in (2, 3)
-            assert slm.data is False
-
-
-class _CountingStim(StimWithPipeline):
-    """StimWithPipeline that records every ``get_stim_mask`` call so tests
-    can assert pipelines don't compute on frames that won't consume the result.
-
-    ``call_timesteps`` is appended from the pipeline worker thread and read by
-    the test thread after ``run_and_wait`` joins — that join establishes the
-    happens-before needed for safe reads; ``list.append`` is atomic in CPython.
-    """
-
-    required_metadata: set[str] = {"img_shape"}
-
-    def __init__(self):
-        self.call_timesteps: list[int] = []
-
-    def get_stim_mask(self, *, label_images, metadata: dict, img=None, tracks=None):
-        self.call_timesteps.append(metadata.get("timestep", -1))
-        h, w = metadata["img_shape"]
-        return np.zeros((h, w), dtype=np.uint8), None
-
-
-class TestCurrentModeSkipsComputeOnNonStim:
-    """In ``current`` mode, no one peeks a non-stim frame's mask, so the
-    pipeline must not invoke the stimulator on non-stim frames — that's
-    wasted work.
-    """
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.stim = _CountingStim()
-        self.pipeline = _make_pipeline_with_stim(self.path, self.stim)
-        self.mic = CircleMicroscope(dmd=FakeDMD())
-        self.ctrl = Controller(self.mic, self.pipeline)
-        events = make_events(5, stim_frames=(2, 3))
-        run_and_wait(self.ctrl, events, stim_mode="current")
-
-    def test_stim_computed_only_on_stim_frames(self):
-        assert sorted(self.stim.call_timesteps) == [2, 3]
-
-
-class TestPreviousModeComputesOnEveryFrame:
-    """In ``previous`` mode, every frame must compute so the next frame's
-    t-1 peek has something to read.
-    """
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.stim = _CountingStim()
-        self.pipeline = _make_pipeline_with_stim(self.path, self.stim)
-        self.mic = CircleMicroscope(dmd=FakeDMD())
-        self.ctrl = Controller(self.mic, self.pipeline)
-        events = make_events(5, stim_frames=(2, 3))
-        run_and_wait(self.ctrl, events, stim_mode="previous")
-
-    def test_stim_computed_on_every_frame(self):
-        assert sorted(self.stim.call_timesteps) == [0, 1, 2, 3, 4]
-
-
 class TestContinueExperimentModeMismatchRaises:
     """``continue_experiment`` must refuse to change ``stim_mode`` mid-run."""
 
-    def test_raises_on_mode_change(self, tmp_dir):
-        pipeline = _make_pipeline(tmp_dir, with_stim=False)
-        ctrl = Controller(CircleMicroscope(), pipeline)
+    def test_raises_on_mode_change(self, tmp_dir, tracker):
+        pipeline = _make_pipeline(tmp_dir, tracker=tracker, with_stim=False)
+        ctrl = Controller(FakeMicroscope(CircleScene()), pipeline)
         events = make_events(2)
         try:
             ctrl.run_experiment(events, stim_mode="current", validate=False)
-            wait_for_pipeline(ctrl._analyzer)
+            ctrl._analyzer.wait_idle()
             with pytest.raises(RuntimeError, match="stim_mode"):
                 ctrl.continue_experiment(
                     make_events(2), stim_mode="previous", validate=False
                 )
         finally:
             ctrl.finish_experiment()
-
-
-@pytest.mark.parametrize(
-    "stim_mode, tag_offset",
-    [("current", 0), ("previous", -1)],
-)
-class TestStimMaskFileReflectsFired:
-    """The stim_mask .tiff under frame t stores what actually fired at t.
-
-    ``current`` mode → offset 0 (stored = mask computed at t).
-    ``previous`` mode → offset -1 (stored = mask computed at t-1).
-    Non-stim frames always store zeros.
-    """
-
-    STIM_FRAMES = (2, 3)
-    N_FRAMES = 5
-
-    def test_stored_mask_is_fired_mask(self, tmp_dir, stim_mode, tag_offset):
-        pipeline = _make_pipeline_with_stim(tmp_dir, _FrameTaggingStim())
-        ctrl = Controller(CircleMicroscope(dmd=FakeDMD()), pipeline)
-        events = make_events(self.N_FRAMES, stim_frames=self.STIM_FRAMES)
-        run_and_wait(ctrl, events, stim_mode=stim_mode)
-
-        stim_dir = os.path.join(tmp_dir, "stim_mask")
-        for t in range(self.N_FRAMES):
-            mask = tifffile.imread(os.path.join(stim_dir, f"000_{t:05d}.tiff"))
-            if t in self.STIM_FRAMES:
-                expected = t + tag_offset
-                unique = np.unique(mask)
-                assert unique.size == 1 and int(unique.item()) == expected, (
-                    f"[{stim_mode}] frame {t} should store mask from frame "
-                    f"{expected}, got {unique.tolist()}"
-                )
-            else:
-                assert mask.max() == 0, (
-                    f"[{stim_mode}] frame {t} (non-stim) should store zeros, "
-                    f"got {mask.max()}"
-                )
-
-
-# ===================================================================
-# Test Class 5: Stim (metadata-only) shortcut — mode="current"
-# ===================================================================
-
-
-class TestStimMetadataOnlyCurrent:
-    """Base Stim bypasses pipeline — mask computed synchronously in controller."""
-
-    STIM_FRAMES = (2, 3, 4)
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, MetadataOnlyStim())
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_TIMEPOINTS, stim_frames=self.STIM_FRAMES)
-        run_and_wait(self.ctrl, self.events, stim_mode="current")
-
-    def test_stim_masks_saved(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = [f for f in os.listdir(stim_dir) if f.endswith(".tiff")]
-        assert len(files) == N_TIMEPOINTS
-
-    def test_stim_masks_nonzero_for_stim_frames(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = sorted(os.listdir(stim_dir))
-        for i, f in enumerate(files):
-            mask = tifffile.imread(os.path.join(stim_dir, f))
-            if i in self.STIM_FRAMES:
-                assert (
-                    mask.max() > 0
-                ), f"Frame {i}: metadata-only stim should produce nonzero mask"
-            else:
-                assert (
-                    mask.max() == 0
-                ), f"Frame {i}: non-stim frame should have zero mask"
-
-    def test_segmentation_still_runs(self):
-        labels_dir = os.path.join(self.path, "labels")
-        files = [f for f in os.listdir(labels_dir) if f.endswith(".tiff")]
-        assert len(files) == N_TIMEPOINTS
-
-    def test_tracking_still_works(self):
-        tracks_dir = os.path.join(self.path, "tracks")
-        parquet_files = [f for f in os.listdir(tracks_dir) if f.endswith(".parquet")]
-        assert len(parquet_files) >= 1
-        df = pd.read_parquet(os.path.join(tracks_dir, parquet_files[0]))
-        particles = df["particle"].unique()
-        assert len(particles) == 2
-
-
-# ===================================================================
-# Test Class 6: Stim (metadata-only) shortcut — mode="previous"
-# ===================================================================
-
-
-class TestStimMetadataOnlyPrevious:
-    """Base Stim in 'previous' mode — still computes synchronously."""
-
-    STIM_FRAMES = (2, 3, 4)
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, MetadataOnlyStim())
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_TIMEPOINTS, stim_frames=self.STIM_FRAMES)
-        run_and_wait(self.ctrl, self.events, stim_mode="previous")
-
-    def test_stim_masks_produced(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = [f for f in os.listdir(stim_dir) if f.endswith(".tiff")]
-        assert len(files) == N_TIMEPOINTS
-
-    def test_tracking_consistent(self):
-        tracks_dir = os.path.join(self.path, "tracks")
-        parquet_files = [f for f in os.listdir(tracks_dir) if f.endswith(".parquet")]
-        df = pd.read_parquet(os.path.join(tracks_dir, parquet_files[0]))
-        particles = df["particle"].unique()
-        assert len(particles) == 2
-        for pid in particles:
-            assert len(df[df["particle"] == pid]) == N_TIMEPOINTS
-
-
-# ===================================================================
-# Test Class 7: StimWithImage shortcut — mode="current"
-# ===================================================================
-
-
-class TestStimWithImageCurrent:
-    """StimWithImage — mask computed in storage worker before pipeline."""
-
-    STIM_FRAMES = (2, 3, 4)
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, ImageBasedStim())
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_TIMEPOINTS, stim_frames=self.STIM_FRAMES)
-        run_and_wait(self.ctrl, self.events, stim_mode="current")
-
-    def test_stim_masks_saved(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = [f for f in os.listdir(stim_dir) if f.endswith(".tiff")]
-        assert len(files) == N_TIMEPOINTS
-
-    def test_stim_masks_nonzero_for_stim_frames(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = sorted(os.listdir(stim_dir))
-        for i, f in enumerate(files):
-            mask = tifffile.imread(os.path.join(stim_dir, f))
-            if i in self.STIM_FRAMES:
-                assert (
-                    mask.max() > 0
-                ), f"Frame {i}: image-based stim should produce nonzero mask"
-            else:
-                assert (
-                    mask.max() == 0
-                ), f"Frame {i}: non-stim frame should have zero mask"
-
-    def test_segmentation_still_runs(self):
-        labels_dir = os.path.join(self.path, "labels")
-        files = [f for f in os.listdir(labels_dir) if f.endswith(".tiff")]
-        assert len(files) == N_TIMEPOINTS
-
-    def test_tracking_still_works(self):
-        tracks_dir = os.path.join(self.path, "tracks")
-        parquet_files = [f for f in os.listdir(tracks_dir) if f.endswith(".parquet")]
-        df = pd.read_parquet(os.path.join(tracks_dir, parquet_files[0]))
-        particles = df["particle"].unique()
-        assert len(particles) == 2
-
-
-# ===================================================================
-# Test Class 8: StimWithImage shortcut — mode="previous"
-# ===================================================================
-
-
-class TestStimWithImagePrevious:
-    """StimWithImage in 'previous' mode — mask from storage worker, used next frame."""
-
-    STIM_FRAMES = (2, 3, 4)
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_pipeline_with_stim(self.path, ImageBasedStim())
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_TIMEPOINTS, stim_frames=self.STIM_FRAMES)
-        run_and_wait(self.ctrl, self.events, stim_mode="previous")
-
-    def test_stim_masks_produced(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = [f for f in os.listdir(stim_dir) if f.endswith(".tiff")]
-        assert len(files) == N_TIMEPOINTS
-
-    def test_tracking_consistent(self):
-        tracks_dir = os.path.join(self.path, "tracks")
-        parquet_files = [f for f in os.listdir(tracks_dir) if f.endswith(".parquet")]
-        df = pd.read_parquet(os.path.join(tracks_dir, parquet_files[0]))
-        particles = df["particle"].unique()
-        assert len(particles) == 2
-        for pid in particles:
-            assert len(df[df["particle"] == pid]) == N_TIMEPOINTS
-
-
-# ===================================================================
-# Stress test helpers
-# ===================================================================
-
-
-class SlowSegmentator(OtsuSegmentator):
-    """OtsuSegmentator that sleeps *delay* seconds per frame to simulate load."""
-
-    def __init__(self, delay: float = 1.0):
-        super().__init__()
-        self._delay = delay
-
-    def segment(self, image: np.ndarray) -> np.ndarray:
-        time.sleep(self._delay)
-        return super().segment(image)
-
-
-def run_and_wait_long(
-    ctrl: Controller,
-    events: list[RTMEvent],
-    stim_mode: str = "current",
-    timeout: float = 120,
-):
-    """Like run_and_wait but with a longer timeout for slow pipelines."""
-    ctrl.run_experiment(events, stim_mode=stim_mode, validate=False)
-
-    analyzer = ctrl._analyzer
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        storage_empty = analyzer._storage_queue.qsize() == 0
-        with analyzer.task_lock:
-            pipeline_idle = analyzer.active_pipeline_tasks == 0
-        deferred_empty = analyzer._deferred_queue.qsize() == 0
-        if storage_empty and pipeline_idle and deferred_empty:
-            break
-        time.sleep(0.5)
-
-    analyzer.shutdown(wait=True)
-
-
-# ===================================================================
-# Test Class 9: Stress test — slow segmentation, rapid acquisition
-# ===================================================================
-
-
-N_STRESS_FRAMES = 50
-STRESS_SEG_DELAY = 0.1  # seconds per segmentation
-
-
-class TestStressSlowSegmentation:
-    """Acquire 20 frames with no delay while segmentation takes 1s each.
-
-    Verifies that the deferred-queue mechanism in Analyzer eventually
-    processes every frame: all raw images stored, all segmentation masks
-    produced, all stim masks produced, and tracking covers every frame.
-    """
-
-    STIM_FRAMES = tuple(range(5, 15))  # stim on frames 5-14
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = ImageProcessingPipeline(
-            storage_path=self.path,
-            segmentators=[
-                SegmentationMethod(
-                    "labels", SlowSegmentator(STRESS_SEG_DELAY), 0, False
-                )
-            ],
-            tracker=TrackerTrackpy(search_range=50, memory=3),
-            feature_extractor=SimpleFE("labels"),
-            stimulator=CenterCircle(),
-        )
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_STRESS_FRAMES, stim_frames=self.STIM_FRAMES)
-        run_and_wait_long(
-            self.ctrl,
-            self.events,
-            stim_mode="current",
-            timeout=N_STRESS_FRAMES * STRESS_SEG_DELAY + 60,
-        )
-
-    def test_all_raw_images_stored(self):
-        raw_dir = os.path.join(self.path, "raw")
-        files = [f for f in os.listdir(raw_dir) if f.endswith(".tiff")]
-        assert (
-            len(files) == N_STRESS_FRAMES
-        ), f"Expected {N_STRESS_FRAMES} raw TIFFs, got {len(files)}"
-
-    def test_all_segmentation_masks_produced(self):
-        labels_dir = os.path.join(self.path, "labels")
-        files = [f for f in os.listdir(labels_dir) if f.endswith(".tiff")]
-        assert (
-            len(files) == N_STRESS_FRAMES
-        ), f"Expected {N_STRESS_FRAMES} label masks, got {len(files)}"
-
-    def test_all_stim_masks_produced(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = [f for f in os.listdir(stim_dir) if f.endswith(".tiff")]
-        assert (
-            len(files) == N_STRESS_FRAMES
-        ), f"Expected {N_STRESS_FRAMES} stim masks, got {len(files)}"
-
-    def test_stim_masks_nonzero_on_stim_frames(self):
-        stim_dir = os.path.join(self.path, "stim_mask")
-        files = sorted(os.listdir(stim_dir))
-        for i, f in enumerate(files):
-            mask = tifffile.imread(os.path.join(stim_dir, f))
-            if i in self.STIM_FRAMES:
-                assert mask.max() > 0, f"Frame {i}: stim frame should have nonzero mask"
-
-    def test_tracking_covers_all_frames(self):
-        tracks_dir = os.path.join(self.path, "tracks")
-        parquet_files = [f for f in os.listdir(tracks_dir) if f.endswith(".parquet")]
-        assert len(parquet_files) >= 1
-        df = pd.read_parquet(os.path.join(tracks_dir, parquet_files[0]))
-        particles = df["particle"].unique()
-        assert len(particles) == 2, f"Expected 2 particles, got {len(particles)}"
-        for pid in particles:
-            rows = df[df["particle"] == pid]
-            assert (
-                len(rows) == N_STRESS_FRAMES
-            ), f"Particle {pid}: expected {N_STRESS_FRAMES} rows, got {len(rows)}"
-
-    def test_segmentation_quality_maintained(self):
-        """Even under load, every frame should segment into exactly 2 labels."""
-        labels_dir = os.path.join(self.path, "labels")
-        files = sorted([f for f in os.listdir(labels_dir) if f.endswith(".tiff")])
-        for f in files:
-            labels = tifffile.imread(os.path.join(labels_dir, f))
-            unique = set(np.unique(labels)) - {0}
-            assert len(unique) == 2, f"{f}: expected 2 labels, got {len(unique)}"
-
-
-# ===================================================================
-# Failing component helpers
-# ===================================================================
-
-
-class CrashingSegmentator(OtsuSegmentator):
-    """Segmentator that raises on every call."""
-
-    def segment(self, image: np.ndarray) -> np.ndarray:
-        raise RuntimeError("Segmentation crashed!")
-
-
-class CrashingTracker(TrackerTrackpy):
-    """Tracker that raises on every call."""
-
-    def track_cells(self, df_old, df_new, fov_state):
-        raise RuntimeError("Tracking crashed!")
-
-
-class CrashingStimulator(CenterCircle):
-    """StimWithPipeline that raises on every stim call."""
-
-    def get_stim_mask(self, label_images, metadata=None, img=None, tracks=None):
-        raise RuntimeError("Stimulation crashed!")
-
-
-class CrashingFE(SimpleFE):
-    """Feature extractor that raises on every call."""
-
-    def extract_features(self, labels, image, df_tracked=None, metadata=None):
-        raise RuntimeError("Feature extraction crashed!")
-
-
-# ===================================================================
-# Crash-test helpers
-# ===================================================================
-
-N_CRASH_FRAMES = 3
-CRASH_QUEUE_TIMEOUT = 1  # seconds (instead of default 20)
-
-
-def _make_crashing_pipeline(
-    path, *, segmentator=None, tracker=None, fe=None, stim=None
-):
-    """Build a pipeline with short queue timeout for crash tests."""
-    pipeline = ImageProcessingPipeline(
-        storage_path=path,
-        segmentators=[
-            SegmentationMethod("labels", segmentator or OtsuSegmentator(), 0, False)
-        ],
-        tracker=tracker or TrackerTrackpy(search_range=50, memory=3),
-        feature_extractor=fe or SimpleFE("labels"),
-        stimulator=stim,
-    )
-    pipeline._queue_timeout = CRASH_QUEUE_TIMEOUT
-    return pipeline
-
-
-# ===================================================================
-# Test Class 10: Failing segmentator — raw images must still be saved
-# ===================================================================
-
-
-class TestCrashingSegmentator:
-    """Pipeline crashes during segmentation. Raw images should still be saved."""
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_crashing_pipeline(
-            self.path,
-            segmentator=CrashingSegmentator(),
-        )
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_CRASH_FRAMES)
-        run_and_wait(self.ctrl, self.events)
-
-    def test_all_raw_images_saved(self):
-        """Raw images are saved BEFORE pipeline.run(), so they must all exist."""
-        raw_dir = os.path.join(self.path, "raw")
-        files = [f for f in os.listdir(raw_dir) if f.endswith(".tiff")]
-        assert len(files) == N_CRASH_FRAMES
-
-    def test_no_segmentation_masks(self):
-        """Pipeline crashed during segmentation, so no label masks should exist."""
-        labels_dir = os.path.join(self.path, "labels")
-        if not os.path.isdir(labels_dir):
-            return  # directory never created ⇒ no masks saved
-        files = [f for f in os.listdir(labels_dir) if f.endswith(".tiff")]
-        assert len(files) == 0
-
-
-# ===================================================================
-# Test Class 11: Failing tracker — raw images saved
-# ===================================================================
-
-
-class TestCrashingTracker:
-    """Pipeline crashes during tracking. Raw images should still be saved."""
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_crashing_pipeline(
-            self.path,
-            tracker=CrashingTracker(search_range=50, memory=3),
-        )
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_CRASH_FRAMES)
-        run_and_wait(self.ctrl, self.events)
-
-    def test_all_raw_images_saved(self):
-        raw_dir = os.path.join(self.path, "raw")
-        files = [f for f in os.listdir(raw_dir) if f.endswith(".tiff")]
-        assert len(files) == N_CRASH_FRAMES
-
-    def test_no_segmentation_masks_saved(self):
-        """Crash happens after segmentation but before TIFF save (which is after put()).
-        Since tracking crashes before put(), the TIFF saves never run."""
-        labels_dir = os.path.join(self.path, "labels")
-        if not os.path.isdir(labels_dir):
-            return  # directory never created ⇒ no masks saved
-        files = [f for f in os.listdir(labels_dir) if f.endswith(".tiff")]
-        assert len(files) == 0
-
-
-# ===================================================================
-# Test Class 12: Failing stimulator — raw images saved
-# ===================================================================
-
-
-class TestCrashingStimulator:
-    """Pipeline crashes during stim mask generation. Raw images should still be saved."""
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        # Stim on last frame only so no subsequent frame waits on the broken put()
-        self.n_frames = N_CRASH_FRAMES
-        self.stim_frames = (self.n_frames - 1,)
-        self.pipeline = _make_crashing_pipeline(
-            self.path,
-            stim=CrashingStimulator(),
-        )
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(self.n_frames, stim_frames=self.stim_frames)
-        run_and_wait(self.ctrl, self.events, stim_mode="current")
-
-    def test_all_raw_images_saved(self):
-        raw_dir = os.path.join(self.path, "raw")
-        files = [f for f in os.listdir(raw_dir) if f.endswith(".tiff")]
-        assert len(files) == self.n_frames
-
-
-# ===================================================================
-# Test Class 13: Failing feature extractor — raw images saved
-# ===================================================================
-
-
-class TestCrashingFeatureExtractor:
-    """Pipeline crashes during feature extraction. Raw images should still be saved."""
-
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
-        self.path = tmp_dir
-        self.pipeline = _make_crashing_pipeline(
-            self.path,
-            fe=CrashingFE("labels"),
-        )
-        self.mic = CircleMicroscope()
-        self.ctrl = Controller(self.mic, self.pipeline)
-        self.events = make_events(N_CRASH_FRAMES)
-        run_and_wait(self.ctrl, self.events)
-
-    def test_all_raw_images_saved(self):
-        raw_dir = os.path.join(self.path, "raw")
-        files = [f for f in os.listdir(raw_dir) if f.endswith(".tiff")]
-        assert len(files) == N_CRASH_FRAMES
-
-    def test_no_segmentation_masks_saved(self):
-        """FE crash happens before put() and TIFF saves, so no masks are written."""
-        labels_dir = os.path.join(self.path, "labels")
-        if not os.path.isdir(labels_dir):
-            return  # directory never created ⇒ no masks saved
-        files = [f for f in os.listdir(labels_dir) if f.endswith(".tiff")]
-        assert len(files) == 0
-
-
-# ===================================================================
-# Continuation / extension helpers
-# ===================================================================
-
-
-def wait_for_pipeline(analyzer: Analyzer, timeout: float = 30):
-    """Block until all storage and pipeline work finishes (no shutdown)."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        storage_empty = analyzer._storage_queue.qsize() == 0
-        with analyzer.task_lock:
-            pipeline_idle = analyzer.active_pipeline_tasks == 0
-        deferred_empty = analyzer._deferred_queue.qsize() == 0
-        if storage_empty and pipeline_idle and deferred_empty:
-            break
-        time.sleep(0.1)
-
-
-# ===================================================================
-# Test Class 14: Continue experiment — sequential continuation
-# ===================================================================
-
 
 N_PHASE1_FRAMES = 3
 N_PHASE2_FRAMES = 3
@@ -1383,21 +155,21 @@ class TestContinueExperiment:
     """Run 3 frames, continue with 3 more, verify seamless continuation."""
 
     @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
+    def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline(self.path, with_stim=False)
-        self.mic = CircleMicroscope()
+        self.pipeline = _make_pipeline(self.path, tracker=tracker, with_stim=False)
+        self.mic = FakeMicroscope(CircleScene())
         self.ctrl = Controller(self.mic, self.pipeline)
 
         # Phase 1
         phase1_events = make_events(N_PHASE1_FRAMES)
         self.ctrl.run_experiment(phase1_events, validate=False)
-        wait_for_pipeline(self.ctrl._analyzer)
+        self.ctrl._analyzer.wait_idle()
 
         # Phase 2 — continue (reuses Analyzer)
         phase2_events = make_events(N_PHASE2_FRAMES)
         self.ctrl.continue_experiment(phase2_events, validate=False)
-        wait_for_pipeline(self.ctrl._analyzer)
+        self.ctrl._analyzer.wait_idle()
 
         self.ctrl.finish_experiment()
 
@@ -1454,10 +226,10 @@ class TestExtendExperiment:
     """Start 3 frames, extend with 3 more mid-run, verify all processed."""
 
     @pytest.fixture(autouse=True)
-    def setup(self, tmp_dir):
+    def setup(self, tmp_dir, tracker):
         self.path = tmp_dir
-        self.pipeline = _make_pipeline(self.path, with_stim=False)
-        self.mic = CircleMicroscope()
+        self.pipeline = _make_pipeline(self.path, tracker=tracker, with_stim=False)
+        self.mic = FakeMicroscope(CircleScene())
         self.ctrl = Controller(self.mic, self.pipeline)
 
         initial_events = make_events(N_INITIAL_FRAMES)
@@ -1471,7 +243,7 @@ class TestExtendExperiment:
         self.ctrl._pre_loop_hook = inject_extension
         self.ctrl.run_experiment(initial_events, validate=False)
 
-        wait_for_pipeline(self.ctrl._analyzer)
+        self.ctrl._analyzer.wait_idle()
         self.ctrl.finish_experiment()
 
     def test_correct_number_of_raw_images(self):
@@ -1509,9 +281,9 @@ class TestExtendExperiment:
 class TestContinueWithoutRunRaises:
     """Calling continue_experiment without run_experiment should raise."""
 
-    def test_raises_runtime_error(self, tmp_dir):
-        pipeline = _make_pipeline(tmp_dir, with_stim=False)
-        mic = CircleMicroscope()
+    def test_raises_runtime_error(self, tmp_dir, tracker):
+        pipeline = _make_pipeline(tmp_dir, tracker=tracker, with_stim=False)
+        mic = FakeMicroscope(CircleScene())
         ctrl = Controller(mic, pipeline)
         events = make_events(3)
         with pytest.raises(RuntimeError, match="No experiment to continue"):
@@ -1523,236 +295,6 @@ class TestContinueWithoutRunRaises:
 # ===================================================================
 
 
-N_BURST_FRAMES = 100
-FIRST_FRAME_DELAY = 1.0
-_BURST_IMG_SIZE = 16
-
-
-def _make_tiny_image() -> np.ndarray:
-    """10x10 uint16 image with two bright pixels (labels 1 and 2)."""
-    img = np.zeros((_BURST_IMG_SIZE, _BURST_IMG_SIZE), dtype=np.uint16)
-    img[3, 3] = 50000
-    img[12, 12] = 50000
-    return img
-
-
-class _TinyMicroscope(AbstractMicroscope):
-    """Microscope emitting tiny images as fast as possible."""
-
-    def __init__(self):
-        super().__init__()
-        self._callback = None
-        self._cancel = threading.Event()
-
-    def connect_frame(self, callback):
-        self._callback = callback
-
-    def disconnect_frame(self, callback):
-        if self._callback is callback:
-            self._callback = None
-
-    def run_mda(self, event_iter):
-        self._cancel.clear()
-
-        def _run():
-            for event in event_iter:
-                if self._cancel.is_set():
-                    break
-                if self._callback is not None:
-                    self._callback(_make_tiny_image(), event)
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        return t
-
-    def cancel_mda(self):
-        self._cancel.set()
-
-
-class _FastSegmentator(OtsuSegmentator):
-    """Near-instant segmentator: threshold + label.
-
-    First call is delayed to create pipeline back-pressure.
-    """
-
-    def __init__(self, first_delay: float = FIRST_FRAME_DELAY):
-        super().__init__()
-        self._first_delay = first_delay
-        self._lock = threading.Lock()
-        self._first_done = False
-
-    def segment(self, image: np.ndarray) -> np.ndarray:
-        from skimage.measure import label
-
-        with self._lock:
-            is_first = not self._first_done
-            self._first_done = True
-        if is_first:
-            time.sleep(self._first_delay)
-        return label(image > image.mean())
-
-
-class _FastTracker:
-    """Tracker that assigns particle IDs by label without trackpy linking."""
-
-    required_metadata: set[str] = set()
-
-    def track_cells(self, df_old, df_new, fov_state):
-        if "particle" not in df_new.columns:
-            df_new = df_new.copy()
-            df_new["particle"] = df_new["label"]
-        return pd.concat([df_old, df_new], ignore_index=True)
-
-
-class _FastFE:
-    """Feature extractor returning positions and area via regionprops."""
-
-    def __init__(self, used_mask):
-        self.used_mask = used_mask
-
-    def extract_positions(self, labels):
-        from skimage.measure import regionprops_table
-
-        table = regionprops_table(
-            labels[self.used_mask], properties=["label", "centroid"]
-        )
-        df = pd.DataFrame.from_dict(table)
-        df = df.rename({"centroid-0": "x", "centroid-1": "y"}, axis="columns")
-        return df
-
-    def extract_features(self, labels, image, df_tracked=None, metadata=None):
-        from skimage.measure import regionprops_table
-
-        table = regionprops_table(labels[self.used_mask], properties=["label", "area"])
-        return pd.DataFrame.from_dict(table), None
-
-
-@pytest.fixture(scope="module")
-def burst_result():
-    """Run the burst experiment once and share results across all tests."""
-    path = tempfile.mkdtemp()
-    pipeline = ImageProcessingPipeline(
-        storage_path=path,
-        segmentators=[
-            SegmentationMethod("labels", _FastSegmentator(), 0, False),
-        ],
-        tracker=_FastTracker(),
-        feature_extractor=_FastFE("labels"),
-        stimulator=CenterCircle(),
-    )
-    pipeline._queue_timeout = 120
-    mic = _TinyMicroscope()
-    ctrl = Controller(mic, pipeline)
-    stim_frames = tuple(range(10, 20))
-    events = make_events(N_BURST_FRAMES, stim_frames=stim_frames)
-    run_and_wait_long(
-        ctrl,
-        events,
-        stim_mode="current",
-        timeout=FIRST_FRAME_DELAY + N_BURST_FRAMES * 0.1 + 60,
-    )
-    yield path
-    shutil.rmtree(path)
-
-
-class TestBurstNoSignalLoss:
-    """Dispatch 100 frames rapidly while the first frame blocks the pipeline.
-
-    Uses tiny images (16x16) and fast fakes for segmentation/tracking/FE so
-    the test exercises the controller's dispatch plumbing (queues, deferred
-    worker, storage) rather than real image-analysis performance.
-    """
-
-    def test_all_raw_images_stored(self, burst_result):
-        """Storage path: no images silently dropped."""
-        raw_dir = os.path.join(burst_result, "raw")
-        files = [f for f in os.listdir(raw_dir) if f.endswith(".tiff")]
-        assert (
-            len(files) == N_BURST_FRAMES
-        ), f"Expected {N_BURST_FRAMES} raw TIFFs, got {len(files)}"
-
-    def test_all_segmentation_masks_produced(self, burst_result):
-        """Pipeline path: every frame segmented despite initial block."""
-        labels_dir = os.path.join(burst_result, "labels")
-        files = [f for f in os.listdir(labels_dir) if f.endswith(".tiff")]
-        assert (
-            len(files) == N_BURST_FRAMES
-        ), f"Expected {N_BURST_FRAMES} label masks, got {len(files)}"
-
-    def test_all_stim_masks_produced(self, burst_result):
-        """Stim path: every frame produced a stim mask."""
-        stim_dir = os.path.join(burst_result, "stim_mask")
-        files = [f for f in os.listdir(stim_dir) if f.endswith(".tiff")]
-        assert (
-            len(files) == N_BURST_FRAMES
-        ), f"Expected {N_BURST_FRAMES} stim masks, got {len(files)}"
-
-    def test_tracking_covers_all_frames(self, burst_result):
-        """Tracking: both particles tracked across every frame."""
-        tracks_dir = os.path.join(burst_result, "tracks")
-        parquet_files = [f for f in os.listdir(tracks_dir) if f.endswith(".parquet")]
-        assert len(parquet_files) >= 1
-        df = pd.read_parquet(os.path.join(tracks_dir, parquet_files[0]))
-        particles = df["particle"].unique()
-        assert len(particles) == 2, f"Expected 2 particles, got {len(particles)}"
-        for pid in particles:
-            rows = df[df["particle"] == pid]
-            assert (
-                len(rows) == N_BURST_FRAMES
-            ), f"Particle {pid}: expected {N_BURST_FRAMES} rows, got {len(rows)}"
-
-
-# ===================================================================
-# Test Class: Analyzer.get_stim_mask timeout recording
-# ===================================================================
-
-
-class TestStimMaskTimeout:
-    """Analyzer.get_stim_mask records a background error when the queue times out.
-
-    Regression guard for the silent-stim-frame bug: on the first stim
-    frame, the pipeline hadn't produced a mask yet, get_stim_mask timed
-    out, and the fallback silently sent False to the SLM with nothing
-    recorded. Hardware tests (which assert background_errors == [])
-    should fail loudly in that case.
-    """
-
-    @pytest.fixture
-    def analyzer(self, tmp_dir) -> Iterator[Analyzer]:
-        pipeline = _make_pipeline_with_stim(tmp_dir, ImageBasedStim())
-        instance = Analyzer(pipeline=pipeline)
-        yield instance
-        instance.shutdown(wait=True)
-
-    def test_timeout_records_background_error(self, analyzer):
-        result = analyzer.get_stim_mask(fov_index=7, metadata={}, timeout=0.05)
-        assert result is None
-        assert len(analyzer.background_errors) == 1
-        err = analyzer.background_errors[0]
-        assert err.source == "stim_mask"
-        assert err.exc_type == "TimeoutError"
-        assert "FOV 7" in err.message
-        assert "0.05" in err.message
-        # Traceback should reflect the TimeoutError raise site, not the
-        # bare QueueEmpty — regression guard for the format_exc() bug.
-        assert "TimeoutError" in err.traceback
-
-    def test_ready_mask_returns_value_without_recording(self, analyzer):
-        """Happy path: a mask already in the queue is returned, no error recorded."""
-        mask = np.ones((32, 32), dtype=np.uint8)
-        analyzer.get_fov_state(0).stim_mask_queue.put_for_frame(0, mask)
-        result = analyzer.get_stim_mask(
-            fov_index=0, metadata={"timestep": 0}, timeout=5.0
-        )
-        assert result is mask
-        assert analyzer.background_errors == []
-
-
-# ===================================================================
-# Test Class: empty-frame edge cases (no cells detected)
-# ===================================================================
-
-
 class TestEmptyFrameEdgeCases:
     """Pipeline must not crash when segmentation finds zero cells.
 
@@ -1760,28 +302,28 @@ class TestEmptyFrameEdgeCases:
     and the ref-channel FE path.
     """
 
-    def test_all_frames_blank_no_errors(self, tmp_dir):
+    def test_all_frames_blank_no_errors(self, tmp_dir, tracker):
         """Every frame is blank — pipeline runs, no background errors."""
-        mic = CircleMicroscope(blank_frames={0, 1, 2, 3, 4})
-        pipeline = _make_pipeline(tmp_dir, with_stim=False)
+        mic = FakeMicroscope(CircleScene(blank_frames={0, 1, 2, 3, 4}))
+        pipeline = _make_pipeline(tmp_dir, tracker=tracker, with_stim=False)
         ctrl = Controller(mic, pipeline)
         events = make_events(5)
         run_and_wait(ctrl, events)
         assert_no_background_errors(ctrl)
 
-    def test_all_frames_blank_with_stim_no_errors(self, tmp_dir):
+    def test_all_frames_blank_with_stim_no_errors(self, tmp_dir, tracker):
         """Blank frames + stim active — stim mask dispatch must not crash."""
-        mic = CircleMicroscope(blank_frames={0, 1, 2, 3, 4})
-        pipeline = _make_pipeline(tmp_dir, with_stim=True)
+        mic = FakeMicroscope(CircleScene(blank_frames={0, 1, 2, 3, 4}))
+        pipeline = _make_pipeline(tmp_dir, tracker=tracker, with_stim=True)
         ctrl = Controller(mic, pipeline)
         events = make_events(5, stim_frames=(1, 2, 3, 4))
         run_and_wait(ctrl, events, stim_mode="current")
         assert_no_background_errors(ctrl)
 
-    def test_cells_appear_after_blank_start(self, tmp_dir):
+    def test_cells_appear_after_blank_start(self, tmp_dir, tracker):
         """Frames 0-1 blank, frames 2-4 have cells — tracking picks up."""
-        mic = CircleMicroscope(blank_frames={0, 1})
-        pipeline = _make_pipeline(tmp_dir, with_stim=False)
+        mic = FakeMicroscope(CircleScene(blank_frames={0, 1}))
+        pipeline = _make_pipeline(tmp_dir, tracker=tracker, with_stim=False)
         ctrl = Controller(mic, pipeline)
         events = make_events(5)
         run_and_wait(ctrl, events)
@@ -1797,14 +339,14 @@ class TestEmptyFrameEdgeCases:
             count = len(df[df["particle"] == pid])
             assert count == 3, f"Particle {pid} tracked {count} times, expected 3"
 
-    def test_cells_disappear_then_reappear(self, tmp_dir):
+    def test_cells_disappear_then_reappear(self, tmp_dir, tracker):
         """Frames 0,1 have cells, frame 2 blank, frames 3,4 have cells.
 
         The tracker should link across the gap (memory=3 allows up to 3
         missing frames) and produce the same 2 particle IDs throughout.
         """
-        mic = CircleMicroscope(blank_frames={2})
-        pipeline = _make_pipeline(tmp_dir, with_stim=False)
+        mic = FakeMicroscope(CircleScene(blank_frames={2}))
+        pipeline = _make_pipeline(tmp_dir, tracker=tracker, with_stim=False)
         ctrl = Controller(mic, pipeline)
         events = make_events(5)
         run_and_wait(ctrl, events)
@@ -1819,11 +361,11 @@ class TestEmptyFrameEdgeCases:
             count = len(df[df["particle"] == pid])
             assert count == 4, f"Particle {pid} tracked {count} times, expected 4"
 
-    def test_cells_disappear_reappear_with_stim(self, tmp_dir):
+    def test_cells_disappear_reappear_with_stim(self, tmp_dir, tracker):
         """Same gap pattern but with stim active — verifies stim_mask_queue
         doesn't deadlock or crash when pipeline has no labels to stim."""
-        mic = CircleMicroscope(blank_frames={2})
-        pipeline = _make_pipeline(tmp_dir, with_stim=True)
+        mic = FakeMicroscope(CircleScene(blank_frames={2}))
+        pipeline = _make_pipeline(tmp_dir, tracker=tracker, with_stim=True)
         ctrl = Controller(mic, pipeline)
         events = make_events(5, stim_frames=(1, 2, 3, 4))
         run_and_wait(ctrl, events, stim_mode="current")

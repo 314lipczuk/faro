@@ -92,10 +92,16 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         return {**detected, **self.POWER_PROPERTIES}
 
     def validate_hardware(self, events) -> bool:
+        # Materialize once so both the base and util checks can iterate.
+        events = list(events)
+        ok = super().validate_hardware(events)
         if self.mmc is None:
-            return True  # nothing to validate against
+            return ok  # nothing else to validate against
         # Auto-detect on first use if not yet done
         if self._detected_power_properties is None:
             self.detect_power_properties()
         from faro.core.utils import validate_hardware
-        return validate_hardware(events, self.mmc, power_properties=self.get_power_properties())
+        ok_mmc = validate_hardware(
+            events, self.mmc, power_properties=self.get_power_properties()
+        )
+        return ok and ok_mmc

@@ -236,6 +236,7 @@ class FovState:
         self.linker = None
         self.fov_timestep_counter = 0
         self.n_cells_latest = 0
+        self.next_particle_id = 0
 
 
 @dataclass

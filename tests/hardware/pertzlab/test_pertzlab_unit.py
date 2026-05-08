@@ -1,15 +1,22 @@
-"""Tests for auto-detection of power properties from Micro-Manager configs.
+"""Pure-Python unit tests for Pertzlab-specific faro code.
 
-These tests are specific to the Pertzlab microscope setups (Spectra / LedDMD
-light sources with *_Level properties and DA TTL LED state devices).
+Lives under ``tests/hardware/pertzlab/`` because its subjects are
+Pertzlab-scope-only: :func:`faro.core.utils.detect_power_properties`
+exercised with the Spectra / LedDMD / DA TTL LED configuration shapes
+we actually use, and
+:class:`faro.microscope.pertzlab.moench.MoenchMDAEngine`'s
+``SKIP_WAIT_DEVICES`` filter.
+
+These do **not** require a real scope and are **not** marked
+``@pytest.mark.hardware``; they run in every test session.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from tests.test_validate_hardware import FakeMMCore
 from faro.core.utils import detect_power_properties
+from tests.fake_mmc import build_validation_core as _core
 
 
 # ===================================================================
@@ -21,7 +28,7 @@ class TestDetectPowerProperties:
 
     def test_detects_spectra_cyan(self):
         """CyanStim config activating Cyan LED → (Spectra, Cyan_Level)."""
-        mmc = FakeMMCore(
+        mmc = _core(
             config_groups={"TTL_ERK": ["CyanStim", "miRFP", "BF"]},
             devices={"Spectra": ["Cyan_Level", "Red_Level", "Green_Level"]},
             config_data={
@@ -47,7 +54,7 @@ class TestDetectPowerProperties:
 
     def test_greenyellow_matches_green_level(self):
         """GreenYellow LED label matches Green_Level via prefix."""
-        mmc = FakeMMCore(
+        mmc = _core(
             config_groups={"Channel": ["mScarlet3"]},
             devices={"Spectra": ["Green_Level"]},
             config_data={
@@ -61,7 +68,7 @@ class TestDetectPowerProperties:
 
     def test_scans_specific_group(self):
         """When group is specified, only that group is scanned."""
-        mmc = FakeMMCore(
+        mmc = _core(
             config_groups={
                 "TTL_ERK": ["CyanStim"],
                 "Other": ["SomeConfig"],
@@ -78,7 +85,7 @@ class TestDetectPowerProperties:
 
     def test_no_level_devices_returns_empty(self):
         """No devices with *_Level properties → empty result."""
-        mmc = FakeMMCore(
+        mmc = _core(
             config_groups={"Channel": ["GFP"]},
             devices={"Camera": ["Exposure", "Binning"]},
             config_data={("Channel", "GFP"): [("Filter", "Label", "GFP")]},
@@ -87,7 +94,7 @@ class TestDetectPowerProperties:
 
     def test_works_with_leddmd_device(self):
         """Works with LedDMD (Niesen) instead of Spectra."""
-        mmc = FakeMMCore(
+        mmc = _core(
             config_groups={"WF_DMD": ["CyanStim"]},
             devices={"LedDMD": ["Cyan_Level", "Red_Level"]},
             config_data={
@@ -101,7 +108,7 @@ class TestDetectPowerProperties:
         """PyMMCoreMicroscope.get_power_properties merges detected + manual."""
         from faro.microscope.pymmcore import PyMMCoreMicroscope
 
-        mmc = FakeMMCore(
+        mmc = _core(
             config_groups={"TTL_ERK": ["CyanStim", "miRFP"]},
             devices={"Spectra": ["Cyan_Level", "Red_Level"]},
             config_data={

@@ -77,10 +77,34 @@ class AbstractMicroscope:
     def validate_hardware(self, events) -> bool:
         """Validate events against hardware capabilities.
 
-        Base implementation is a no-op (returns True). Subclasses override
-        to check channel configs, exposure limits, device properties, etc.
+        Base implementation only runs the DMD calibration check; subclasses
+        compose extra checks (channel configs, exposure limits, device
+        properties, etc.) by calling ``super().validate_hardware(events)``.
         """
-        return True
+        return self._validate_dmd_calibration(events)
+
+    def _validate_dmd_calibration(self, events) -> bool:
+        """Warn if events contain stim but the DMD isn't calibrated.
+
+        Skipped when the microscope has no DMD or the events have no
+        stim channels — non-DMD setups and non-stim experiments don't
+        need it. Without this check, the failure surfaces deep in the
+        first stim event as ``DMD.affine_transform`` raising
+        ``ValueError("DMD not calibrated...")``.
+        """
+        if self.dmd is None:
+            return True
+        if getattr(self.dmd, "affine", None) is not None:
+            return True
+        if not any(getattr(ev, "stim_channels", ()) for ev in events):
+            return True
+        warnings.warn(
+            "DMD not calibrated (affine matrix is None) but events contain "
+            "stim channels. Run mic.calibrate_dmd() before starting the "
+            "experiment.",
+            UserWarning,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # DMD

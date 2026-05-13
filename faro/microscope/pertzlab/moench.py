@@ -2,6 +2,7 @@ import pymmcore_plus
 import weakref
 
 from faro.microscope.pymmcore import PyMMCoreMicroscope
+from faro.core.data_structures import ImgType
 from faro.core.dmd import DMD
 from faro.core._useq_compat import SLMImage
 from pymmcore_plus.mda._engine import MDAEngine
@@ -195,27 +196,6 @@ class Moench(PyMMCoreMicroscope):
     def post_experiment(self):
         """Post-process the experiment."""
         pass
-
-    def shutdown(self):
-        """Tear down hardware state so the microscope can be discarded.
-
-        Stops the DMD wakeup loop and unloads all Micro-Manager devices
-        so COM ports (notably the LED on COM3) and the SLM handle are
-        released. Without this, pymmcore's native threads keep the
-        Python process alive after the main thread exits, leaving a
-        zombie that blocks the next session with
-        ``Error in device "COM3"`` when MM tries to initialize.
-        """
-        wakeup = getattr(self, "wakeup_dmd", None)
-        if wakeup is not None:
-            try:
-                wakeup.stop()
-            except Exception:
-                pass
-        try:
-            self.mmc.unloadAllDevices()
-        except Exception:
-            pass
 
     def shutdown(self):
         """Tear down hardware state so the microscope can be discarded.
@@ -461,6 +441,36 @@ class MoenchMDAEngine(MDAEngine):
                     f"target={target_xy}, actual={actual_xy}"
                 )
 
+    def setup_sequence(self, sequence):
+        """Pause KeepDMDAlive for the duration of the MDA.
+
+        The engine drives the DMD on every event (stim mask on stim
+        frames, all-on on imaging frames when
+        ``dmd_needs_to_be_waken``), so the 60 s background refresh is
+        redundant during a run and just adds SLM-device contention.
+        Restarted in ``teardown_sequence``.
+        """
+        mic = self.microscope
+        if mic is not None:
+            wakeup = getattr(mic, "wakeup_dmd", None)
+            if wakeup is not None:
+                try:
+                    wakeup.stop()
+                except Exception:
+                    self._log.exception("Failed to stop wakeup_dmd before MDA")
+        return super().setup_sequence(sequence)
+
+    def teardown_sequence(self, sequence) -> None:
+        super().teardown_sequence(sequence)
+        mic = self.microscope
+        if mic is not None:
+            wakeup = getattr(mic, "wakeup_dmd", None)
+            if wakeup is not None:
+                try:
+                    wakeup.run()
+                except Exception:
+                    self._log.exception("Failed to restart wakeup_dmd after MDA")
+
     def setup_event(self, event: MDAEvent) -> None:
         """Override to wait for devices individually, bypassing TIXYDrive.
 
@@ -469,12 +479,56 @@ class MoenchMDAEngine(MDAEngine):
         device individually and handle TIXYDrive separately only when an XY
         move was actually commanded.
         """
+        event = self._maybe_inject_dmd_wake_slm(event)
         if isinstance(event, SequencedEvent):
             self.setup_sequenced_event(event)
         else:
             self.setup_single_event(event)
 
         self._wait_for_system_excluding_xy(event)
+
+    def exec_event(self, event: MDAEvent):
+        """Override to inject the all-on SLM on non-stim events.
+
+        Must mirror ``setup_event``'s injection: ``MDARunner`` keeps its
+        own reference to the original event, so a ``model_copy`` inside
+        ``setup_event`` doesn't propagate. Without this override
+        ``_exec_event_slm_image`` (the ``displaySLMImage`` that arms the
+        pattern for the next camera TTL) never fires for non-stim
+        events, leaving the previously latched stim pattern to pulse
+        instead.
+        """
+        event = self._maybe_inject_dmd_wake_slm(event)
+        yield from super().exec_event(event)
+
+    def _maybe_inject_dmd_wake_slm(self, event: MDAEvent) -> MDAEvent:
+        """Hold the DMD all-on for non-stim captures.
+
+        Under OverlapMode=On the DMD re-pulses its currently loaded
+        pattern on every camera TTL. After a stim event the stim
+        pattern stays latched, so subsequent imaging events at the
+        same timepoint (e.g. other FOVs in an FOV-batched burst)
+        would pulse the stim pattern instead of an all-on frame and
+        come back dark. KeepDMDAlive's 60 s refresh is too slow to
+        catch that burst.
+        """
+        if event.slm_image is not None:
+            return event
+        mic = self.microscope
+        if mic is None or not getattr(mic, "dmd_needs_to_be_waken", False):
+            return event
+        dmd = getattr(mic, "dmd", None)
+        if dmd is None:
+            return event
+        if event.metadata.get("img_type") == ImgType.IMG_STIM:
+            return event
+        return event.model_copy(
+            update={
+                "slm_image": SLMImage(
+                    data=True, device=dmd.name, exposure=event.exposure
+                )
+            }
+        )
 
     def setup_single_event(self, event: MDAEvent) -> None:
         """Setup hardware for a single (non-sequenced) event.

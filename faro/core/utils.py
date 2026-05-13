@@ -403,9 +403,16 @@ def _get_mda_from_file(filename):
 
 
 def _get_mda_from_viewer(viewer):
-    import warnings
-
-    data_mda_fovs = viewer.window.dock_widgets["MDA"].value().stage_positions
+    try:
+        mda_widget = viewer.window.dock_widgets["MDA"]
+    except KeyError as e:
+        raise KeyError(
+            "MDA dock widget not registered. Click the 'MDA' button in the "
+            "napari-micromanager toolbar (or call "
+            "`main_window._show_dock_widget('MDA')` programmatically) "
+            "before reading FOVs from the viewer."
+        ) from e
+    data_mda_fovs = mda_widget.value().stage_positions
     return [pos.model_dump() for pos in data_mda_fovs]
 
 

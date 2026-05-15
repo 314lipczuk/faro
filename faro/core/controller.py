@@ -17,6 +17,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Literal
 from faro.core._useq_compat import SLMImage
+from superqt.utils import ensure_main_thread
 from useq import MDAEvent
 from queue import Queue, Empty as QueueEmpty
 import numpy as np
@@ -569,18 +570,33 @@ class Controller:
     """
 
     STOP_EVENT = object()
+    PREVIEW_LAYER_NAME = "pipeline_preview"
 
-    def __init__(self, mic, pipeline, *, writer: Writer | None = None):
+    def __init__(
+        self,
+        mic,
+        pipeline,
+        *,
+        writer: Writer | None = None,
+        viewer=None,
+    ):
         """
         Args:
             mic: AbstractMicroscope instance (hardware + config).
             pipeline: ImageProcessingPipeline instance.
             writer: Storage backend. If None, Analyzer uses TiffWriter (default).
                 Pass an OmeZarrWriter for OME-Zarr output.
+            viewer: Optional napari viewer. When provided, each acquired
+                MDA frame is mirrored to a layer named ``PREVIEW_LAYER_NAME``
+                so the pipeline's input is visible during the run. This is
+                independent of napari-micromanager's live mode (which must
+                not be running during MDA — :meth:`run_experiment` stops it
+                automatically).
         """
         self._mic = mic
         self._pipeline = pipeline
         self._writer = writer
+        self._viewer = viewer
         self._queue: Queue = Queue()
         self._analyzer: Analyzer | None = None
         self._n_channels: int = 1
@@ -836,7 +852,20 @@ class Controller:
 
     def _run_mda_with_events(self, events, *, stim_mode):
         """Run the MDA event loop — shared by run/continue_experiment."""
+        # Live mode (continuous sequence acquisition) and MDA both drive the
+        # camera. If live is still running when the MDA's first snapImage
+        # fires, the snap buffer is consumed by the live-poll listener (in
+        # napari-micromanager: _core_link._image_snapped) before the engine
+        # calls getImage, and the engine raises "Camera image buffer read
+        # failed". Stop it unconditionally before MDA starts.
+        try:
+            if self._mic.mmc.isSequenceRunning():
+                self._mic.mmc.stopSequenceAcquisition()
+        except Exception:
+            pass
+
         self._mic.connect_frame(self._on_frame_ready)
+        self._connect_preview()
 
         # Set up event queue for extend_experiment support.
         # _pending_sentinels tracks how many extra batches (from
@@ -936,11 +965,44 @@ class Controller:
             if mda_thread is not None:
                 mda_thread.join()
             self._mic.disconnect_frame(self._on_frame_ready)
+            self._disconnect_preview()
 
         if self._fatal_error is not None:
             fatal = self._fatal_error
             self._fatal_error = None
             raise fatal
+
+    # ------------------------------------------------------------------
+    # Preview (optional napari viewer mirror of the latest MDA frame)
+    # ------------------------------------------------------------------
+
+    def _connect_preview(self) -> None:
+        """Register the preview-update callback if a viewer was provided."""
+        if self._viewer is None:
+            return
+        self._mic.connect_frame(self._on_preview_frame)
+
+    def _disconnect_preview(self) -> None:
+        if self._viewer is None:
+            return
+        try:
+            self._mic.disconnect_frame(self._on_preview_frame)
+        except Exception:
+            pass
+
+    def _on_preview_frame(self, img: np.ndarray, event: MDAEvent) -> None:
+        """``frameReady`` from the MDA worker; hand off to the main thread."""
+        self._apply_preview(img)
+
+    @ensure_main_thread  # type: ignore[untyped-decorator]
+    def _apply_preview(self, data: np.ndarray) -> None:
+        """Update the napari preview layer (always runs on the main thread)."""
+        if self._viewer is None:
+            return
+        try:
+            self._viewer.layers[self.PREVIEW_LAYER_NAME].data = data
+        except KeyError:
+            self._viewer.add_image(data, name=self.PREVIEW_LAYER_NAME)
 
     # ------------------------------------------------------------------
     # Frame handling

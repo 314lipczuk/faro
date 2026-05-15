@@ -755,6 +755,28 @@ class Controller:
                 "handle.cancel() first."
             )
 
+    def _get_image_size(self) -> tuple[int, int]:
+        """Return (height, width) of the microscope's camera frames.
+
+        Prefers ``self._mic.image_height`` / ``image_width`` (the
+        ``AbstractMicroscope``-level convention; ``Moench.init_scope`` and
+        peers populate them on the microscope instance). Falls back to a
+        pymmcore-plus core call when the microscope exposes one. Raises if
+        neither is available.
+        """
+        h = getattr(self._mic, "image_height", None)
+        w = getattr(self._mic, "image_width", None)
+        if h is not None and w is not None:
+            return h, w
+        mmc = getattr(self._mic, "mmc", None)
+        if mmc is not None:
+            return mmc.getImageHeight(), mmc.getImageWidth()
+        raise RuntimeError(
+            "Microscope does not expose image dimensions. Set "
+            "self.image_height / self.image_width on the microscope, or "
+            "provide a CMMCorePlus instance via self.mmc."
+        )
+
     def _run_worker(
         self, events, stim_mode: str, handle: RunHandle, /, *, is_continue: bool
     ) -> None:
@@ -792,11 +814,12 @@ class Controller:
                 # multi-minute rmtree. With the feed loop on a worker thread
                 # this no longer freezes napari; status stays "running" until
                 # the actual MDA starts.
+                img_h, img_w = self._get_image_size()
                 self._writer.init_stream(
                     position_names=_extract_positions_from_events(events),
                     channel_names=_extract_channel_names_from_events(events),
-                    image_height=self._mic.mmc.getImageHeight(),
-                    image_width=self._mic.mmc.getImageWidth(),
+                    image_height=img_h,
+                    image_width=img_w,
                     n_timepoints=_extract_n_timepoints_from_events(events),
                     n_stim_channels=_extract_n_stim_channels_from_events(events),
                 )

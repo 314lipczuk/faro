@@ -57,6 +57,18 @@ class ExperimentStatusWidget(QWidget):
 
         controller.runStarted.connect(self._on_run_started)
 
+        # psygnal's queued connections (used by statusChanged below) park
+        # callbacks in a per-thread queue that nothing drains by default.
+        # start_emitting_from_queue installs a QTimer on the main thread
+        # that calls psygnal.emit_queued() on every Qt event-loop tick, so
+        # worker-thread emits actually reach the widget. Idempotent: safe
+        # to call from multiple widgets / multiple constructions.
+        try:
+            from psygnal.qt import start_emitting_from_queue
+            start_emitting_from_queue()
+        except ImportError:
+            pass
+
     # -- UI construction ----------------------------------------------------
 
     def _build_ui(self) -> None:
@@ -112,7 +124,13 @@ class ExperimentStatusWidget(QWidget):
                 pass
 
         self._handle = handle
-        handle.statusChanged.connect(self._refresh)
+        # thread="main" routes worker-thread emits through Qt's queued
+        # connection to the main thread. Without it, the slot runs
+        # synchronously on the emitter (worker / engine) thread and
+        # touches QWidgets from off-main -- under napari that lands
+        # in vispy/OpenGL with "Cannot make QOpenGLContext current in
+        # a different thread" -> SIGABRT.
+        handle.statusChanged.connect(self._refresh, thread="main")
         self._refresh(handle.status())
 
     def _on_stop_clicked(self) -> None:

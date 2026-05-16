@@ -28,7 +28,9 @@ if TYPE_CHECKING:
     pass
 
 
-RunState = Literal["pending", "running", "cancelling", "done", "error"]
+RunState = Literal[
+    "pending", "running", "pausing", "paused", "cancelling", "done", "error"
+]
 
 
 @dataclass(frozen=True)
@@ -73,11 +75,20 @@ class RunHandle:
     # gives an instance-bound signal. Different handles have independent signals.
     statusChanged = Signal(RunStatus)
 
-    def __init__(self, n_events_total: int = 0) -> None:
+    def __init__(
+        self, n_events_total: int = 0, events: list | None = None
+    ) -> None:
         self._lock = threading.RLock()
         self._status = RunStatus(state="pending", n_events_total=n_events_total)
         self._cancel_event = threading.Event()
+        self._pause_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Optional snapshot of the (sorted) RTMEvents this handle is driving.
+        # Widgets use this to render per-event visualisations (e.g. an event
+        # strip + FOV map) that need to know the full run plan up front.
+        # ``None`` keeps backward-compat with callers that construct
+        # RunHandle directly without an events list.
+        self.events: list | None = list(events) if events is not None else None
 
     # -- public API ---------------------------------------------------------
 
@@ -108,9 +119,45 @@ class RunHandle:
         block until the worker actually stops.
         """
         self._cancel_event.set()
+        # A cancel during pause must also release the feed loop's pause-wait.
+        self._pause_event.clear()
+        with self._lock:
+            if self._status.state in ("running", "pausing", "paused"):
+                self._status = replace(self._status, state="cancelling")
+                new_status = self._status
+            else:
+                return
+        self.statusChanged.emit(new_status)
+
+    def pause(self) -> None:
+        """Request a graceful pause. Idempotent. Does not block.
+
+        Sets the pause event the feed loop polls before pulling each new
+        RTMEvent. The loop finishes feeding the current event, then halts
+        at the next iteration -- the MDA engine drains whatever is already
+        queued, and no further events are fed until :meth:`resume`. State
+        goes ``running -> pausing`` here; the feed loop flips it to
+        ``paused`` once it actually stops.
+        """
+        if self._pause_event.is_set():
+            return
+        self._pause_event.set()
         with self._lock:
             if self._status.state == "running":
-                self._status = replace(self._status, state="cancelling")
+                self._status = replace(self._status, state="pausing")
+                new_status = self._status
+            else:
+                return
+        self.statusChanged.emit(new_status)
+
+    def resume(self) -> None:
+        """Resume a paused run. Idempotent. Does not block."""
+        if not self._pause_event.is_set():
+            return
+        self._pause_event.clear()
+        with self._lock:
+            if self._status.state in ("pausing", "paused"):
+                self._status = replace(self._status, state="running")
                 new_status = self._status
             else:
                 return
@@ -120,12 +167,21 @@ class RunHandle:
         """True if the worker thread is alive."""
         return self._thread is not None and self._thread.is_alive()
 
+    def is_paused(self) -> bool:
+        """True if a pause has been requested (pausing or paused)."""
+        return self._pause_event.is_set()
+
     # -- worker-side helpers ------------------------------------------------
 
     @property
     def cancel_event(self) -> threading.Event:
         """The cooperative-cancel event the feed loop polls. Worker-side."""
         return self._cancel_event
+
+    @property
+    def pause_event(self) -> threading.Event:
+        """The cooperative-pause event the feed loop polls. Worker-side."""
+        return self._pause_event
 
     def update(self, **updates: Any) -> RunStatus:
         """Atomically apply ``updates`` to the status snapshot and emit.

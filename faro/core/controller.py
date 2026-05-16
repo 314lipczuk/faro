@@ -682,7 +682,15 @@ class Controller:
                     "Fix the issues or pass validate=False to skip."
                 )
 
-        handle = RunHandle(n_events_total=len(events))
+        # Sort once here so the order the worker processes them matches
+        # the order the widget displays. _run_mda_with_events also sorts
+        # (idempotent on an already-sorted list); doing it here lets us
+        # stash the canonical sequence on the handle for status widgets.
+        events = sorted(
+            events, key=lambda e: (e.min_start_time or 0, e.index.get("p", 0))
+        )
+
+        handle = RunHandle(n_events_total=len(events), events=events)
         self._current_handle = handle
 
         handle._thread = threading.Thread(
@@ -732,8 +740,14 @@ class Controller:
                 )
 
         offset_events = self._offset_events(events)
+        offset_events = sorted(
+            offset_events,
+            key=lambda e: (e.min_start_time or 0, e.index.get("p", 0)),
+        )
 
-        handle = RunHandle(n_events_total=len(offset_events))
+        handle = RunHandle(
+            n_events_total=len(offset_events), events=offset_events
+        )
         self._current_handle = handle
 
         handle._thread = threading.Thread(
@@ -975,6 +989,17 @@ class Controller:
 
         self._mic.connect_frame(self._on_frame_ready)
 
+        # Recreate the engine queue for this run. The finally-block below
+        # puts a STOP_EVENT sentinel into self._queue to stop the engine;
+        # on a *cancelled* run the engine is aborted via cancel_mda() and
+        # may stop without draining the queue, leaving stale events + the
+        # STOP sentinel behind. Reusing that queue for the next run makes
+        # the new engine consume the stale sentinel and exit almost
+        # immediately -- the feed loop keeps pushing but nothing snaps
+        # (the run "sticks" after a few events). A fresh queue per run
+        # avoids that entirely.
+        self._queue = Queue()
+
         # Set up event queue for extend_experiment support.
         # _pending_sentinels tracks how many extra batches (from
         # extend_experiment) still need to be drained.
@@ -998,6 +1023,21 @@ class Controller:
             while True:
                 if handle.cancel_event.is_set():
                     break
+
+                # Pause: stop feeding new events before pulling the next
+                # one. The MDA engine drains whatever is already queued
+                # (in-flight event + backpressure window), then idles.
+                # No new events are fed until resume() clears the event.
+                if handle.pause_event.is_set():
+                    handle.update(state="paused")
+                    while handle.pause_event.is_set():
+                        if handle.cancel_event.is_set():
+                            break
+                        time.sleep(0.05)
+                    if handle.cancel_event.is_set():
+                        break
+                    handle.update(state="running")
+                    continue
 
                 # Short timeout so cancellation is responsive even when
                 # the queue is empty (waiting for extend_experiment).
@@ -1095,9 +1135,19 @@ class Controller:
     # ------------------------------------------------------------------
 
     def _bump_status_for_frame(self, event: MDAEvent) -> None:
-        """Update RunHandle counters for the current frame; no-op if no handle."""
+        """Update RunHandle counters for the current frame; no-op if no handle.
+
+        Stim emissions are skipped: a stim frame is the SLM-illuminated
+        snap that fires alongside its imaging frame, so counting it would
+        double-update the widget per stim event (lag/elapsed appearing
+        to refresh twice in quick succession). Imaging + ref frames are
+        the meaningful "data frames" the user cares about.
+        """
         handle = self._current_handle
         if handle is None:
+            return
+        img_type = (event.metadata or {}).get("img_type", ImgType.IMG_RAW)
+        if img_type == ImgType.IMG_STIM:
             return
         prev = handle.status()
         wallclock = time.time()

@@ -17,9 +17,14 @@ Layout (top to bottom):
   - FOV map      (one dot per unique FOV position, equal-aspect, with a
     grey path drawn in visit order; the dot for the current FOV is
     re-colored in the active event-type's color)
-  - Stats form   (event N/M, elapsed, scheduled, lag, remaining, frames,
-    background errors)
-  - Stop button  (calls ``handle.cancel()``)
+  - Stats panels (three separate shaded frames: timing -- event N/M,
+    elapsed, scheduled, lag, remaining; queues -- storage / pipeline /
+    deferred depths, the bounded two drawn as fill bars; errors)
+  - Pause + Stop buttons
+
+The Stop button cancels the run *and* calls ``finish_experiment()``
+(flush buffered frames to disk, drop the Analyzer) so the next run
+starts clean; the state banner shows ``STOPPING...`` for the duration.
 
 The widget subscribes to ``ctrl.runStarted``, so it automatically re-binds
 to whichever run is current. Each ``RunHandle.statusChanged`` emission
@@ -41,6 +46,7 @@ from qtpy.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -88,6 +94,17 @@ _MIN_WORLD_EXTENT  = 1e-6
 # Lag warn threshold (red is recognizable on both light and dark themes)
 _LAG_WARN_S        = 5.0
 _LAG_BAD_COLOR     = "#e53935"
+
+# Queue fill bars (storage / pipeline). The bar's chunk is a translucent
+# fill drawn *behind* the "N / max" text; depth >= _QUEUE_WARN_FRAC of max
+# flips fill + text to red, mirroring the lag warning.
+_QUEUE_BAR_HEIGHT  = 18
+_QUEUE_WARN_FRAC   = 0.8
+# Neutral mid-grey: at low-ish alpha it lightens a dark theme and darkens
+# a light one, so it reads on both without hardcoding a theme color (the
+# same trick as _PANEL_BG).
+_BAR_FILL          = "rgba(128, 128, 128, 120)"
+_BAR_FILL_WARN     = "rgba(229, 57, 53, 130)"    # _LAG_BAD_COLOR, translucent
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -204,6 +221,58 @@ def _chip_style(color_hex: str, *, active: bool) -> str:
         f"background-color: rgba({r},{g},{b},60); color: rgba({r},{g},{b},180); "
         f"padding: 2px 8px; border-radius: {_RADIUS_PX}px; font-weight: bold;"
     )
+
+
+def _bar_style(warn: bool) -> str:
+    """Stylesheet for a queue fill bar; *warn* swaps fill + text to red."""
+    fill = _BAR_FILL_WARN if warn else _BAR_FILL
+    text = f"color: {_LAG_BAD_COLOR}; font-weight: bold; " if warn else ""
+    return (
+        f"QProgressBar {{ border: none; border-radius: {_RADIUS_PX}px; "
+        f"background-color: {_PANEL_BG}; {text}}}"
+        f"QProgressBar::chunk {{ background-color: {fill}; "
+        f"border-radius: {_RADIUS_PX}px; }}"
+    )
+
+
+def _make_queue_bar(font) -> QProgressBar:
+    """A compact QProgressBar used as a fill bar behind 'N / max' text.
+
+    The chunk *is* the background fill; the format string carries the
+    numeric read-out. ``bar._warn`` caches the last applied warn state so
+    the stylesheet is only re-set when it actually changes.
+    """
+    bar = QProgressBar()
+    bar.setTextVisible(True)
+    bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    bar.setFixedHeight(_QUEUE_BAR_HEIGHT)
+    bar.setFont(font)
+    bar.setRange(0, 1)
+    bar.setValue(0)
+    bar.setFormat("-")
+    bar._warn = None  # None -> first _set_queue_bar always applies a style
+    bar.setStyleSheet(_bar_style(False))
+    return bar
+
+
+def _wrap_panel(form: QFormLayout) -> QFrame:
+    """Wrap a stats form in a subtly-shaded, rounded panel frame.
+
+    Echoes napari's boxed layer-controls sections. Each stats section
+    gets its own panel, so the layout's normal inter-widget spacing
+    reads as a clear gap between distinct areas (a hairline rule did
+    not separate them clearly enough).
+    """
+    panel = QFrame()
+    panel.setObjectName("faroPanel")
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.addLayout(form)
+    panel.setStyleSheet(
+        f"QFrame#faroPanel {{ background-color: {_PANEL_BG}; "
+        f"border-radius: {_RADIUS_PX}px; }}"
+    )
+    return panel
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -324,22 +393,18 @@ class FovMap(QWidget):
         self._current = -1
         self._active_color = EVENT_COLORS["imaging"]
         self.setMinimumWidth(160)
-        # Expand to the available width; height is pinned square in
-        # resizeEvent. heightForWidth is intentionally NOT used --
-        # QVBoxLayout honors it poorly and ends up distributing slack
-        # space above and below the widget.
+        # The paint code (_world_to_screen) already confines the drawing
+        # to the largest centered square in min(width, height), so the
+        # *widget* itself need not be square. Make it freely resizable in
+        # both directions. The old approach -- setSizePolicy(.., Fixed)
+        # plus setFixedHeight(width) in resizeEvent -- pinned the panel's
+        # minimum height to its width, so once the dock was undocked and
+        # widened it could no longer be shrunk vertically.
         from qtpy.QtWidgets import QSizePolicy
         self.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        self.setFixedHeight(160)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        # Keep the widget square: height tracks width. setFixedHeight to
-        # the same value is a no-op, so this settles after one relayout.
-        if self.height() != self.width():
-            self.setFixedHeight(self.width())
+        self.setMinimumHeight(80)
 
     def set_positions(self, positions: Sequence[tuple[float, float]]) -> None:
         self._positions = list(positions)
@@ -450,6 +515,9 @@ class ExperimentStatusWidget(QWidget):
         super().__init__(parent)
         self._controller = controller
         self._handle: RunHandle | None = None
+        # True while _on_stop_clicked is inside cancel()+finish_experiment();
+        # _refresh keeps the state banner on "STOPPING..." for the duration.
+        self._finishing = False
 
         # Cached plan derived from handle.events at run start
         self._event_types: list[str] = []
@@ -517,47 +585,63 @@ class ExperimentStatusWidget(QWidget):
         self._scheduled_value = QLabel("-")
         self._lag_value       = QLabel("-")
         self._remaining_value = QLabel("-")
+        self._deferred_value  = QLabel("-")
         self._errors_value    = QLabel("-")
         right_align = (
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         for w in (
             self._event_value, self._elapsed_value, self._scheduled_value,
-            self._lag_value, self._remaining_value, self._errors_value,
+            self._lag_value, self._remaining_value, self._deferred_value,
+            self._errors_value,
         ):
             w.setAlignment(right_align)
         for w in (self._elapsed_value, self._scheduled_value,
-                  self._lag_value, self._remaining_value):
+                  self._lag_value, self._remaining_value,
+                  self._deferred_value):
             w.setFont(mono)
 
-        form = QFormLayout()
-        form.setContentsMargins(6, 6, 6, 6)
-        form.setSpacing(2)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        # Stretch the value column so right-aligned text lands at the
-        # widget's right edge instead of hugging the label.
-        form.setFieldGrowthPolicy(
-            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
-        )
-        form.addRow("event:",     self._event_value)
-        form.addRow("elapsed:",   self._elapsed_value)
-        form.addRow("scheduled:", self._scheduled_value)
-        form.addRow("lag:",       self._lag_value)
-        form.addRow("remaining:", self._remaining_value)
-        form.addRow("errors:",    self._errors_value)
+        # storage / pipeline depths render as a fill bar behind "N / max"
+        # text -- a QProgressBar whose chunk *is* the background fill.
+        # deferred has no bound, so it stays a plain count label.
+        self._storage_bar  = _make_queue_bar(mono)
+        self._pipeline_bar = _make_queue_bar(mono)
 
-        # ── Stats panel: a subtly-shaded frame echoing napari's boxed
-        # layer-controls sections. (The FOV map paints its own matching
-        # background in paintEvent, so it isn't wrapped in a frame.)
-        stats_panel = QFrame()
-        stats_panel.setObjectName("faroPanel")
-        stats_panel_layout = QVBoxLayout(stats_panel)
-        stats_panel_layout.setContentsMargins(0, 0, 0, 0)
-        stats_panel_layout.addLayout(form)
-        stats_panel.setStyleSheet(
-            f"QFrame#faroPanel {{ background-color: {_PANEL_BG}; "
-            f"border-radius: {_RADIUS_PX}px; }}"
-        )
+        def _stat_form() -> QFormLayout:
+            f = QFormLayout()
+            f.setContentsMargins(6, 6, 6, 6)
+            f.setSpacing(2)
+            f.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+            # Stretch the value column so right-aligned text / the queue
+            # bars land at the panel's right edge, not hugging the label.
+            f.setFieldGrowthPolicy(
+                QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+            )
+            return f
+
+        timing_form = _stat_form()
+        timing_form.addRow("event:",     self._event_value)
+        timing_form.addRow("elapsed:",   self._elapsed_value)
+        timing_form.addRow("scheduled:", self._scheduled_value)
+        timing_form.addRow("lag:",       self._lag_value)
+        timing_form.addRow("remaining:", self._remaining_value)
+
+        queues_form = _stat_form()
+        queues_form.addRow("storage:",  self._storage_bar)
+        queues_form.addRow("pipeline:", self._pipeline_bar)
+        queues_form.addRow("deferred:", self._deferred_value)
+
+        errors_form = _stat_form()
+        errors_form.addRow("errors:", self._errors_value)
+
+        # ── Stats panels: three separate shaded frames (timing / queues
+        # / errors). Standalone panels with the layout's normal spacing
+        # between them -- like the FOV map above -- read as clearly
+        # distinct areas. (The FOV map paints its own matching background
+        # in paintEvent, so it isn't wrapped here.)
+        timing_panel = _wrap_panel(timing_form)
+        queues_panel = _wrap_panel(queues_form)
+        errors_panel = _wrap_panel(errors_form)
 
         # ── Pause + Stop buttons
         self._pause_btn = QPushButton("Pause")
@@ -577,12 +661,16 @@ class ExperimentStatusWidget(QWidget):
         layout.addWidget(self._state_label)
         layout.addLayout(legend_row)
         layout.addWidget(self._strip)
-        # No stretch on the map -- resizeEvent pins it square, and the
-        # trailing stretch absorbs leftover vertical space below.
-        layout.addWidget(self._map)
-        layout.addWidget(stats_panel)
+        # The map is the one elastic element: give it the layout stretch
+        # so all leftover vertical space goes to it (the map then draws
+        # the largest centered square that fits). No trailing addStretch
+        # -- that spacer used to swallow the slack and pin the map at its
+        # minimum height.
+        layout.addWidget(self._map, 1)
+        layout.addWidget(timing_panel)
+        layout.addWidget(queues_panel)
+        layout.addWidget(errors_panel)
         layout.addLayout(button_row)
-        layout.addStretch(1)
 
     # -- run binding --------------------------------------------------------
 
@@ -614,8 +702,41 @@ class ExperimentStatusWidget(QWidget):
         self._refresh(handle.status())
 
     def _on_stop_clicked(self) -> None:
-        if self._handle is not None:
+        """Cancel the run, then finish the experiment.
+
+        ``cancel()`` aborts the acquisition loop; ``finish_experiment()``
+        then flushes buffered frames to disk and disposes of the
+        Analyzer, so the next run starts clean instead of leaking the
+        old one. The finish drain runs with the Qt loop pumped, so
+        napari stays responsive; the state banner reads ``STOPPING...``
+        until it returns.
+        """
+        if self._handle is None or self._finishing:
+            return
+        self._finishing = True
+        # Disable both buttons up front: finish_experiment() blocks this
+        # slot (pumping Qt), so without this a second click would re-enter.
+        self._stop_btn.setEnabled(False)
+        self._pause_btn.setEnabled(False)
+        self._state_label.setText("STOPPING...")
+        failed = False
+        try:
             self._handle.cancel()
+            self._controller.finish_experiment()
+        except BaseException as exc:  # noqa: BLE001 - surface, don't crash the slot
+            import traceback
+            traceback.print_exc()
+            self._state_label.setText(f"STOP FAILED: {type(exc).__name__}")
+            failed = True
+        finally:
+            self._finishing = False
+        if failed:
+            # finish_experiment may leave the Analyzer alive (e.g. a drain
+            # timeout) -- re-enable Stop so the user can retry.
+            self._stop_btn.setEnabled(True)
+        else:
+            # Teardown done -- reflect the run's final state.
+            self._refresh(self._handle.status() if self._handle else None)
 
     def _on_pause_clicked(self) -> None:
         """Toggle pause / resume on the bound handle."""
@@ -638,8 +759,14 @@ class ExperimentStatusWidget(QWidget):
             return
 
         # ── State banner -- plain bold text, no background fill (a colored
-        # banner clashed with the imaging/stim/ref legend colors).
-        self._state_label.setText(status.state.upper())
+        # banner clashed with the imaging/stim/ref legend colors). While
+        # _on_stop_clicked runs, keep it on STOPPING... -- statusChanged
+        # emissions from the winding-down worker would otherwise flip it
+        # to DONE before the finish drain completes.
+        if self._finishing:
+            self._state_label.setText("STOPPING...")
+        else:
+            self._state_label.setText(status.state.upper())
 
         # ── Strip + map cursor
         cur_idx = self._current_index(status)
@@ -678,8 +805,13 @@ class ExperimentStatusWidget(QWidget):
             self._errors_value.setText(str(n_errors))
             self._errors_value.setStyleSheet("")
 
-        # ── Buttons
-        self._update_buttons(status.state)
+        # ── Queue depths
+        self._render_queue_fields()
+
+        # ── Buttons -- left alone while finishing (deliberately disabled
+        # by _on_stop_clicked; a stale "running" emission must not re-enable).
+        if not self._finishing:
+            self._update_buttons(status.state)
 
     def _update_buttons(self, state: str) -> None:
         """Enable/label Pause + Stop according to the run state."""
@@ -706,23 +838,26 @@ class ExperimentStatusWidget(QWidget):
         self._lag_value.setStyleSheet("")
         self._errors_value.setText("-")
         self._errors_value.setStyleSheet("")
+        self._render_queue_fields()
         self._pause_btn.setEnabled(False)
         self._pause_btn.setText("Pause")
         self._stop_btn.setEnabled(False)
 
     @staticmethod
     def _current_index(status: RunStatus) -> int:
-        """Index of the most-recently-*snapped* event (-1 if none yet).
+        """Index of the RTMEvent currently being acquired (-1 if none yet).
 
-        Uses ``n_frames_received`` (actual imaging/ref snaps) rather than
-        ``n_events_consumed`` (the feed loop's queue-ahead position). The
-        feed loop runs 3-4 events ahead of the engine because of the
-        backpressure window, so keying off it would make the strip jump
-        and the scheduled-time field flicker between the queued event and
-        the snapped one. Both ``_refresh`` and the ``_tick`` QTimer call
-        this so they always agree on "current".
+        Uses ``n_events_acquired`` -- RTMEvents whose first frame has
+        arrived -- which is the *same unit* as ``n_events_total`` and as
+        the event strip / FOV map, so progress can never exceed the
+        total. Deliberately NOT ``n_frames_received`` (that counts
+        per-channel MDAEvents, ~2-3 per RTMEvent, so it overshoots the
+        total) and NOT ``n_events_consumed`` (the feed loop runs several
+        events ahead of the engine because of the backpressure window,
+        which would make the strip jump). Both ``_refresh`` and the
+        ``_tick`` QTimer call this so they always agree on "current".
         """
-        return status.n_frames_received - 1 if status.n_frames_received > 0 else -1
+        return status.n_events_acquired - 1 if status.n_events_acquired > 0 else -1
 
     def _render_time_fields(self, status: RunStatus, cur_idx: int) -> None:
         # Elapsed: prefer (now - started_at); fall back to last_frame_wallclock.
@@ -774,6 +909,53 @@ class ExperimentStatusWidget(QWidget):
             format_duration(remaining) if remaining is not None else "-"
         )
 
+    def _render_queue_fields(self) -> None:
+        """Refresh the storage / pipeline / deferred read-outs.
+
+        Polled from the QTimer so the depths track live between frames --
+        in particular the storage bar is seen draining to 0 while
+        finish_experiment() runs. Shows empty "-" bars when no experiment
+        is active.
+        """
+        stats = self._controller.queue_stats()
+        if stats is None:
+            self._set_queue_bar(self._storage_bar, 0, 0)
+            self._set_queue_bar(self._pipeline_bar, 0, 0)
+            self._deferred_value.setText("-")
+            return
+        self._set_queue_bar(
+            self._storage_bar, stats.storage_depth, stats.storage_max
+        )
+        self._set_queue_bar(
+            self._pipeline_bar, stats.pipeline_inflight, stats.pipeline_max
+        )
+        self._deferred_value.setText(str(stats.deferred_depth))
+
+    @staticmethod
+    def _set_queue_bar(bar: QProgressBar, depth: int, maximum: int) -> None:
+        """Drive one queue bar: fill fraction, 'N / max' text, warn color.
+
+        Fill + text turn red once depth reaches _QUEUE_WARN_FRAC of max --
+        a near-full storage queue means disk writes can't keep pace and
+        the camera buffer is at risk. ``maximum <= 0`` renders an empty
+        "-" bar (no active experiment).
+        """
+        if maximum <= 0:
+            bar.setRange(0, 1)
+            bar.setValue(0)
+            bar.setFormat("-")
+            warn = False
+        else:
+            bar.setRange(0, maximum)
+            bar.setValue(min(depth, maximum))
+            bar.setFormat(f"{depth} / {maximum}")
+            warn = depth >= _QUEUE_WARN_FRAC * maximum
+        # Re-style only on a warn-state change -- setStyleSheet every tick
+        # would force a needless restyle/repaint.
+        if warn != bar._warn:
+            bar._warn = warn
+            bar.setStyleSheet(_bar_style(warn))
+
     def _update_legend(self, active_type: str | None) -> None:
         for key, chip in self._legend_chips.items():
             chip.setStyleSheet(
@@ -781,9 +963,13 @@ class ExperimentStatusWidget(QWidget):
             )
 
     def _tick(self) -> None:
-        """QTimer slot: refresh time-derived fields between status emissions."""
+        """QTimer slot: refresh time-derived + queue fields between emissions."""
         if self._handle is None:
             return
+        # Queue depths move continuously and independently of frames -- poll
+        # them every tick, including during the finish drain so the storage
+        # queue is seen counting down to 0.
+        self._render_queue_fields()
         status = self._handle.status()
         # Keep the clock live while the run is active -- including while
         # paused, since wall-clock elapsed (and thus lag) keeps growing.

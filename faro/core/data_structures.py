@@ -22,6 +22,15 @@ _T = TypeVar("_T")
 StimMask = Union[np.ndarray, bool]
 
 
+class FrameWaitCancelled(Exception):
+    """Raised by :class:`FrameDispenser` wait methods after :meth:`FrameDispenser.cancel`.
+
+    Distinct from :class:`queue.Empty` (a timeout): a cancel is a
+    deliberate abort, not a failure, so callers should unwind quietly
+    rather than recording a background error.
+    """
+
+
 class FrameDispenser(Generic[_T]):
     """Frame-ordered handoff for per-frame values between pipeline workers.
 
@@ -58,6 +67,7 @@ class FrameDispenser(Generic[_T]):
         self._entries: dict[int, _T] = {}
         self._skipped: set[int] = set()
         self._cond = threading.Condition()
+        self._cancelled = False
 
     def put_for_frame(self, idx: int, value: _T) -> None:
         """Record *value* as this frame's output.
@@ -102,6 +112,11 @@ class FrameDispenser(Generic[_T]):
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             while True:
+                if self._cancelled:
+                    raise FrameWaitCancelled(
+                        f"FrameDispenser cancelled while waiting for the "
+                        f"predecessor of frame {idx}"
+                    )
                 status, info = self._resolve_predecessor_locked(idx)
                 if status == "found":
                     value = self._entries[info]
@@ -143,6 +158,10 @@ class FrameDispenser(Generic[_T]):
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             while True:
+                if self._cancelled:
+                    raise FrameWaitCancelled(
+                        f"FrameDispenser cancelled while waiting for frame {idx}"
+                    )
                 if idx in self._entries:
                     return self._entries[idx]
                 if idx in self._skipped:
@@ -180,14 +199,35 @@ class FrameDispenser(Generic[_T]):
                 if k < idx:
                     self._skipped.remove(k)
 
+    def cancel(self) -> None:
+        """Abort every blocked waiter immediately.
+
+        Sets a latch and wakes the condition variable, so any thread
+        parked in :meth:`wait_for_frame` / :meth:`get_predecessor`
+        raises :class:`FrameWaitCancelled` on its next loop pass
+        instead of sitting out the full ``timeout``. This is how an
+        experiment tears down promptly: a feed loop that would
+        otherwise wait up to ``stim_mask_timeout`` seconds for a
+        pipeline mask is released the instant the run is cancelled.
+
+        The latch persists until :meth:`reset` clears it — a cancelled
+        dispenser fails all subsequent waits.
+        """
+        with self._cond:
+            self._cancelled = True
+            self._cond.notify_all()
+
     def reset(self) -> None:
         """Clear all state. Call only when no workers are in-flight —
         waiters with ``timeout=None`` would otherwise block on a chain
         whose predecessors you just erased.
+
+        Also lifts a :meth:`cancel` latch so the dispenser is reusable.
         """
         with self._cond:
             self._entries.clear()
             self._skipped.clear()
+            self._cancelled = False
             self._cond.notify_all()
 
     def _resolve_predecessor_locked(

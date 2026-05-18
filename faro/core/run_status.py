@@ -19,8 +19,9 @@ sees a queued slot call from the worker without extra plumbing.
 from __future__ import annotations
 
 import threading
+import traceback
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from psygnal import Signal
 
@@ -41,16 +42,23 @@ class RunStatus:
     # Latest RTMEvent index the feed loop committed to the MDA queue.
     current_event_index: dict[str, int] | None = None
     current_fov: int | None = None
-    # Counts.
+    # Counts. Note the distinct units:
+    #  - *_events_* counts RTMEvents (one logical timepoint+FOV; expands
+    #    into several MDAEvents -- one per imaging/ref channel + stim).
+    #  - n_frames_received counts MDAEvents (individual channel snaps).
+    # Widgets must compare like-with-like: progress is n_events_acquired
+    # / n_events_total, NOT n_frames_received / n_events_total.
     n_events_total: int = 0          # how many RTMEvents the run was started with
     n_events_consumed: int = 0       # RTMEvents pulled by the feed loop so far
-    n_frames_received: int = 0       # frames acknowledged via frameReady
+    n_events_acquired: int = 0       # RTMEvents whose first frame has arrived
+    n_frames_received: int = 0       # MDAEvent frames acknowledged via frameReady
     # Timing.
     started_at: float | None = None       # time.monotonic() when the worker began
     finished_at: float | None = None      # time.monotonic() when the worker exited
     last_frame_wallclock: float | None = None
-    # Lag: (time.monotonic() - started_at) - event.min_start_time, in ms,
-    # at the most recent frame_ready. Positive == we're behind schedule.
+    # Lag: how late the *current RTMEvent* started acquiring vs its
+    # scheduled min_start_time, in ms. Measured once per RTMEvent (on its
+    # first frame), not per channel-frame. Positive == behind schedule.
     lag_ms: float | None = None
     # Pipeline / storage backpressure visibility (best-effort).
     pipeline_inflight: int = 0
@@ -76,13 +84,22 @@ class RunHandle:
     statusChanged = Signal(RunStatus)
 
     def __init__(
-        self, n_events_total: int = 0, events: list | None = None
+        self,
+        n_events_total: int = 0,
+        events: list | None = None,
+        *,
+        on_cancel: Callable[[], None] | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._status = RunStatus(state="pending", n_events_total=n_events_total)
         self._cancel_event = threading.Event()
         self._pause_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Hook run synchronously on the caller's thread the first time
+        # cancel() is called, before it returns. The controller uses it
+        # to wake a feed loop parked in a stim-mask wait so cancellation
+        # is prompt rather than bounded by the stim-mask timeout.
+        self._on_cancel = on_cancel
         # Optional snapshot of the (sorted) RTMEvents this handle is driving.
         # Widgets use this to render per-event visualisations (e.g. an event
         # strip + FOV map) that need to know the full run plan up front.
@@ -117,10 +134,22 @@ class RunHandle:
         next poll the loop stops feeding new events, asks the MDA engine to
         abort the in-flight event, and exits. Use ``wait()`` afterwards to
         block until the worker actually stops.
+
+        The feed loop can also be parked deep inside a blocking stim-mask
+        wait, where it cannot poll the cancel event. The ``on_cancel``
+        hook (set by the controller) is invoked synchronously here to
+        wake that wait, so cancellation takes effect immediately instead
+        of after the stim-mask timeout.
         """
+        first_cancel = not self._cancel_event.is_set()
         self._cancel_event.set()
         # A cancel during pause must also release the feed loop's pause-wait.
         self._pause_event.clear()
+        if first_cancel and self._on_cancel is not None:
+            try:
+                self._on_cancel()
+            except Exception:
+                traceback.print_exc()
         with self._lock:
             if self._status.state in ("running", "pausing", "paused"):
                 self._status = replace(self._status, state="cancelling")

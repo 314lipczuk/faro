@@ -1,3 +1,7 @@
+import atexit
+import contextlib
+import weakref
+
 from faro.microscope.base import AbstractMicroscope
 
 
@@ -13,6 +17,14 @@ class PyMMCoreMicroscope(AbstractMicroscope):
     are auto-detected from the loaded Micro-Manager config.  Subclasses may
     set ``POWER_PROPERTIES`` to override or supplement the auto-detected
     values.
+
+    On construction, an atexit hook is registered that cancels any running
+    MDA and unloads every Micro-Manager device when the interpreter shuts
+    down. Without this, device adapters can stay bound to the dying Python
+    process and prevent the next process from acquiring the same
+    configuration. Subclasses with extra teardown (background threads,
+    serial ports, etc.) should override :meth:`_teardown_hardware` rather
+    than re-register their own hooks.
     """
 
     MICROMANAGER_PATH = "C:\\Program Files\\Micro-Manager-2.0"
@@ -23,6 +35,41 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         self.mmc = None  # subclasses must set this
         self._detected_power_properties: dict[str, tuple[str, str]] | None = None
         self._current_group: str | None = None
+
+        # Register cleanup via a weakref so the hook doesn't pin the
+        # microscope instance. self.mmc is checked at fire time because
+        # subclasses set it after super().__init__() returns.
+        weak_self = weakref.ref(self)
+
+        def _atexit_teardown() -> None:
+            scope = weak_self()
+            if scope is None:
+                return
+            scope._teardown_hardware()
+
+        atexit.register(_atexit_teardown)
+        self._atexit_teardown = _atexit_teardown
+
+    def _teardown_hardware(self) -> None:
+        """Release all hardware held by this microscope.
+
+        Called from the atexit hook registered in :meth:`__init__`, and
+        also reusable as an explicit teardown step from subclasses that
+        expose a public ``shutdown`` API. Override in subclasses to add
+        extra cleanup (stopping background threads, closing serial ports,
+        etc.) — call ``super()._teardown_hardware()`` last so device
+        unload happens after subclass-owned threads have stopped.
+
+        Suppresses exceptions so a flaky device can't prevent the rest
+        of the teardown (or, in the atexit path, the interpreter's
+        finalization) from running.
+        """
+        if self.mmc is None:
+            return
+        with contextlib.suppress(Exception):
+            self.mmc.mda.cancel()
+        with contextlib.suppress(Exception):
+            self.mmc.unloadAllDevices()
 
     # ------------------------------------------------------------------
     # MDA interface implementation

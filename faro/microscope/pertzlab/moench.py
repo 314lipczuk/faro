@@ -206,6 +206,20 @@ class Moench(PyMMCoreMicroscope):
         Python process alive after the main thread exits, leaving a
         zombie that blocks the next session with
         ``Error in device "COM3"`` when MM tries to initialize.
+
+        Idempotent with the atexit hook registered in
+        :class:`PyMMCoreMicroscope`: calling ``shutdown`` explicitly just
+        runs the same teardown earlier; if it's never called, the hook
+        runs it at interpreter exit.
+        """
+        self._teardown_hardware()
+
+    def _teardown_hardware(self) -> None:
+        """Stop the DMD wakeup thread, then delegate to the base teardown.
+
+        The wakeup thread keeps a reference to the SLM device; stopping
+        it before ``unloadAllDevices`` avoids the unload racing the
+        thread's next ``displaySLMImage`` call.
         """
         wakeup = getattr(self, "wakeup_dmd", None)
         if wakeup is not None:
@@ -213,10 +227,7 @@ class Moench(PyMMCoreMicroscope):
                 wakeup.stop()
             except Exception:
                 pass
-        try:
-            self.mmc.unloadAllDevices()
-        except Exception:
-            pass
+        super()._teardown_hardware()
 
     def register_engine(self, force: bool = False) -> None:
         """Create and register the microscope-specific MDA engine.

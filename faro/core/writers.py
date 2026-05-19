@@ -10,12 +10,22 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 import tifffile
 
 from faro.core.utils import create_folders
+
+
+# Network shares + Windows AV occasionally hold zarr's `.partial.{uuid}`
+# chunk file open for tens of ms while we try to rename it to the final
+# chunk path, surfacing as PermissionError [WinError 5]. Retry with
+# exponential backoff before giving up; the writer's _write_lock keeps
+# our own threads from racing on the same chunk in the meantime.
+_WRITE_RETRY_ATTEMPTS = 6
+_WRITE_RETRY_BASE_DELAY = 0.1  # s; doubles each attempt → ~6.4s total worst case
 
 # Default channel colors for omero metadata (hex RGB)
 _DEFAULT_CHANNEL_COLORS = [
@@ -465,13 +475,17 @@ class OmeZarrWriter:
         chunks = tuple(_chunk_for(k) for k in leading_axes) + trailing_chunks
         shards = tuple(_shard_for(k) for k in leading_axes) + trailing_shards
 
-        root = zarr.open_group(self._zarr_path, mode="w")
-
         axes = [
             {"name": k, "type": _NGFF_AXIS_TYPE.get(k, "other")}
             for k in leading_axes + list(_TRAILING_AXES)
         ]
-        root.attrs["ome"] = {
+        # Bake the OME metadata into the group's initial zarr.json write.
+        # Assigning root.attrs afterwards triggers a *second* write -- an
+        # atomic temp-file + os.replace over the just-created zarr.json --
+        # which intermittently fails with PermissionError (WinError 5) on
+        # SMB/network drives, where the just-written file is still held by
+        # an oplock or AV scan. Writing zarr.json exactly once avoids it.
+        ome_metadata = {
             "version": "0.5",
             "multiscales": [
                 {
@@ -500,6 +514,9 @@ class OmeZarrWriter:
                 ],
             },
         }
+        root = zarr.open_group(
+            self._zarr_path, mode="w", attributes={"ome": ome_metadata}
+        )
 
         # Create the raw data array
         self._raw_array = root.create_array(
@@ -554,14 +571,28 @@ class OmeZarrWriter:
 
     def write(self, img: np.ndarray, metadata: dict, folder: str) -> None:
         with self._write_lock:
-            if folder == "raw":
-                self._write_raw(img, metadata)
-            elif folder == "stim":
-                self._write_stim(img, metadata)
-            elif folder == "ref":
-                self._tiff.write(img, metadata, folder)
-            else:
-                self._write_label(img, metadata, folder)
+            last_err: Exception | None = None
+            for attempt in range(_WRITE_RETRY_ATTEMPTS):
+                try:
+                    if folder == "raw":
+                        self._write_raw(img, metadata)
+                    elif folder == "stim":
+                        self._write_stim(img, metadata)
+                    elif folder == "ref":
+                        self._tiff.write(img, metadata, folder)
+                    else:
+                        self._write_label(img, metadata, folder)
+                    return
+                except (PermissionError, OSError) as e:
+                    # WinError 5 / EACCES typically means antivirus or the
+                    # SMB share momentarily holds the `.partial.{uuid}` chunk
+                    # open while zarr tries to rename it. Backing off briefly
+                    # almost always clears it.
+                    last_err = e
+                    if attempt + 1 < _WRITE_RETRY_ATTEMPTS:
+                        time.sleep(_WRITE_RETRY_BASE_DELAY * (2 ** attempt))
+            assert last_err is not None
+            raise last_err
 
     def close(self) -> None:
         if self._stream is not None:

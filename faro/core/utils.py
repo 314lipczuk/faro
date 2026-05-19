@@ -915,6 +915,7 @@ def apply_fov_batching(
     events: list[RTMEvent],
     time_per_fov: float,
     n_parallel: int | None = None,
+    offset_min_start_time: bool = True,
 ) -> list[RTMEvent]:
     """Adjust timing so that overflow FOVs run in subsequent batches.
 
@@ -928,6 +929,15 @@ def apply_fov_batching(
         time_per_fov: Time (in seconds) to image one FOV.
         n_parallel: Max FOVs per batch.  If *None*, computed from
             ``time_per_fov`` and the inferred timepoint interval.
+        offset_min_start_time: When True (default), stagger each FOV's
+            ``min_start_time`` by its position within its batch times
+            ``time_per_fov``. FOVs in a batch are imaged sequentially,
+            not simultaneously, so the k-th FOV of a batch only starts
+            ~``k * time_per_fov`` after the first. Encoding that in
+            ``min_start_time`` keeps the scheduled per-FOV frame interval
+            consistent and makes lag measurement meaningful. The first
+            FOV of every batch gets 0 offset (its batch wall-clock
+            offset still applies for batches > 0).
 
     Returns:
         New list of RTMEvent with adjusted ``min_start_time`` and ``t``
@@ -937,30 +947,40 @@ def apply_fov_batching(
     fov_ids = sorted({e.index.get("p", 0) for e in events})
     n_fovs = len(fov_ids)
 
-    if n_fovs <= n_parallel:
+    # A single batch with no per-FOV stagger requested is a no-op.
+    if n_fovs <= n_parallel and not offset_min_start_time:
         return list(events)
 
-    # Map each FOV to its batch index
-    fov_to_batch = {fov: i // n_parallel for i, fov in enumerate(fov_ids)}
+    # Sorted position of each FOV: batch = pos // n_parallel,
+    # within-batch slot = pos % n_parallel.
+    fov_pos = {fov: i for i, fov in enumerate(fov_ids)}
 
-    # Per-batch wall-clock offset only — the ``t`` index stays per-FOV
+    # Per-batch wall-clock offset — the ``t`` index stays per-FOV
     # relative (every FOV uses 0..N-1) so the writer's time axis is
     # aligned across batches instead of concatenated. Without this each
     # batch was mapped to a disjoint slab of t and the zarr store had
     # n_batches * N empty rows per FOV.
-    batch0_events = [e for e in events if fov_to_batch[e.index.get("p", 0)] == 0]
-    max_time_batch0 = max(e.min_start_time or 0 for e in batch0_events)
+    batch0_events = [
+        e for e in events if fov_pos[e.index.get("p", 0)] // n_parallel == 0
+    ]
+    max_time_batch0 = max((e.min_start_time or 0 for e in batch0_events), default=0)
     batch_duration = max_time_batch0 + n_parallel * time_per_fov
 
     result: list[RTMEvent] = []
     for ev in events:
         fov = ev.index.get("p", 0)
-        batch = fov_to_batch[fov]
-        if batch == 0:
+        pos = fov_pos[fov]
+        batch = pos // n_parallel
+        slot = pos % n_parallel
+
+        offset = batch * batch_duration
+        if offset_min_start_time:
+            offset += slot * time_per_fov
+
+        if offset == 0:
             result.append(ev)
         else:
-            time_offset = batch * batch_duration
-            new_time = (ev.min_start_time or 0) + time_offset
+            new_time = (ev.min_start_time or 0) + offset
             result.append(ev.model_copy(update={"min_start_time": new_time}))
 
     result.sort(key=lambda e: (e.min_start_time or 0, e.index.get("p", 0)))

@@ -10,6 +10,7 @@ from faro.core.data_structures import (
     FovState,
     RTMEvent,
     RTMSequence,
+    WaitEvent,
 )
 import math
 import random
@@ -741,6 +742,8 @@ def events_to_dataframe(events: list) -> pd.DataFrame:
     """
     rows = []
     for e in events:
+        if isinstance(e, WaitEvent):
+            continue  # timed gap, not an acquired frame
         channels = getattr(e, "channels", ())
         stim_channels = getattr(e, "stim_channels", ())
         ref_channels = getattr(e, "ref_channels", ())

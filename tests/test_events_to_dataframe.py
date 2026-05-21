@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from useq import MDASequence
 
-from faro.core.data_structures import Channel, ImgType, RTMSequence, combine
+from faro.core.data_structures import Channel, ImgType, RTMSequence, combine, wait
 from faro.core.utils import events_to_dataframe
 
 
@@ -49,6 +49,29 @@ class TestMDASequenceCompatibility:
         assert df_rtm.shape == df_mda.shape
         assert (df_rtm["channels"] == df_mda["channels"]).all()
         assert (df_rtm["timestep"] == df_mda["timestep"]).all()
+
+
+class TestWaitEventInDataframe:
+    """WaitEvents are timed gaps, not acquired frames — they must not
+    appear as rows in events_to_dataframe."""
+
+    def test_wait_event_dropped(self):
+        phase1 = RTMSequence(
+            time_plan={"interval": 1.0, "loops": 3},
+            stage_positions=[(0.0, 0.0, 0.0)],
+            channels=[{"config": "phase-contrast", "exposure": 50}],
+        )
+        phase2 = RTMSequence(
+            time_plan={"interval": 1.0, "loops": 2},
+            stage_positions=[(0.0, 0.0, 0.0)],
+            channels=[{"config": "phase-contrast", "exposure": 50}],
+        )
+        events = combine(phase1, wait(10.0), phase2, axis="t")
+        df = events_to_dataframe(events)
+
+        # 3 + 2 frames; the wait contributes no row.
+        assert len(df) == 5
+        assert sorted(df["timestep"].tolist()) == [0, 1, 2, 3, 4]
 
 
 class TestRefPhaseInDataframe:

@@ -14,7 +14,7 @@ import faro.stimulation.base as base_stimulation
 from faro.stimulation.base import StimWithImage, StimWithPipeline
 import faro.tracking.base as abstract_tracker
 import faro.feature_extraction.base as abstract_fe
-from faro.core.data_structures import FovState, ImgType, SegmentationMethod
+from faro.core.data_structures import FovState, ImgType, SegmentationMethod, WaitEvent
 from faro.core.utils import labels_to_particles, create_folders
 from datetime import datetime
 import queue
@@ -311,6 +311,8 @@ class ImageProcessingPipeline:
             stim_required = getattr(self.stimulator, "required_metadata", set())
 
         for event in events:
+            if isinstance(event, WaitEvent):
+                continue  # timed gap, carries no acquisition metadata
             meta_keys = set(event.metadata.keys())
             # General requirements (all events)
             missing = general_required - meta_keys

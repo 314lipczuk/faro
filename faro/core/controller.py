@@ -1186,16 +1186,23 @@ class Controller:
                 if handle.cancel_event.is_set():
                     break
 
-                # Pause: stop feeding new events before pulling the next
-                # one. The MDA engine drains whatever is already queued
-                # (in-flight event + backpressure window), then idles.
-                # No new events are fed until resume() clears the event.
+                # Drain the backpressure window so queued events don't keep
+                # snapping while the user adjusts hardware. min_start_times
+                # are not shifted; late events catch up on resume.
                 if handle.pause_event.is_set():
+                    held: list[MDAEvent] = []
+                    try:
+                        while True:
+                            held.append(self._queue.get_nowait())
+                    except QueueEmpty:
+                        pass
                     handle.update(state="paused")
                     while handle.pause_event.is_set():
                         if handle.cancel_event.is_set():
                             break
                         time.sleep(0.05)
+                    for ev in held:
+                        self._queue.put(ev)
                     if handle.cancel_event.is_set():
                         break
                     handle.update(state="running")

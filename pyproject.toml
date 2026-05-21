@@ -29,6 +29,9 @@ dependencies = [
 test = [
     "pytest",
     "pytest-xdist",
+    # tests/fixtures.py imports TrackerMotile at module load, so the whole
+    # suite fails to collect without motile.
+    "motile",
 ]
 
 stardist = [

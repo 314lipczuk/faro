@@ -107,3 +107,23 @@ class Niesen(PyMMCoreMicroscope):
     def post_experiment(self):
         """Post-process the experiment."""
         self.wl.stop()
+
+    def shutdown(self):
+        """Tear down hardware state so the microscope can be discarded.
+
+        Stops the wake-up-laser keepalive thread and unloads all
+        Micro-Manager devices so COM ports and the SLM handle are
+        released. Without this, pymmcore's native threads keep the
+        Python process alive after the main thread exits, leaving a
+        zombie that blocks the next session.
+        """
+        wl = getattr(self, "wl", None)
+        if wl is not None:
+            try:
+                wl.stop()
+            except Exception:
+                pass
+        try:
+            self.mmc.unloadAllDevices()
+        except Exception:
+            pass

@@ -1,5 +1,5 @@
 from faro.core.pipeline import store_img, ImageProcessingPipeline
-from faro.core.data_structures import FovState, FrameWaitCancelled, ImgType, StimMode
+from faro.core.data_structures import FovState, FrameWaitCancelled, ImgType, StimMode, WaitEvent
 from faro.core.run_status import RunHandle, RunStatus
 from faro.core.writers import (
     Writer,
@@ -905,7 +905,9 @@ class Controller:
         the final wall-clock offset update. All status updates flow through
         ``handle.update`` so listeners see the progression.
         """
-        handle.update(state="running", started_at=time.monotonic())
+        # started_at is set on the first acquired frame (see _on_frame_ready)
+        # so a pre-acquisition WaitEvent doesn't tick elapsed/lag.
+        handle.update(state="running")
         # Fresh RTMEvent-boundary + lag-origin trackers for this run.
         self._rtm_key = None
         self._lag_origin = None
@@ -1223,6 +1225,57 @@ class Controller:
                             continue
                     break
 
+                if isinstance(rtm_event, WaitEvent):
+                    prev = handle.status()
+                    handle.update(
+                        current_event_index=dict(rtm_event.index),
+                        n_events_consumed=prev.n_events_consumed + 1,
+                    )
+                    # Feed loop runs ~3 events ahead of the engine; let
+                    # those in-flight imaging events finish before the
+                    # cursor jumps onto the wait cell.
+                    while not handle.cancel_event.is_set():
+                        s = handle.status()
+                        if s.n_events_acquired >= s.n_events_consumed - 1:
+                            break
+                        if handle.cancel_event.wait(0.05):
+                            break
+                    if handle.cancel_event.is_set():
+                        break
+
+                    base = self._experiment_start or time.monotonic()
+                    # Anchor to whichever is later: scheduled start or now.
+                    # A pause-drain can push wallclock past the scheduled
+                    # window; without max() the wait would flash through.
+                    scheduled_start = base + (rtm_event.min_start_time or 0)
+                    deadline = max(scheduled_start, time.monotonic()) + rtm_event.duration_s
+                    handle.update(state="waiting", wait_remaining_s=rtm_event.duration_s)
+                    last_displayed = int(rtm_event.duration_s)
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        # Throttle emissions to once per displayed second:
+                        # the widget renders int(remaining), so sub-second
+                        # updates only churn the Qt event queue.
+                        cur = int(remaining)
+                        if cur != last_displayed:
+                            handle.update(wait_remaining_s=remaining)
+                            last_displayed = cur
+                        if handle.cancel_event.wait(min(0.1, remaining)):
+                            break
+                    if handle.cancel_event.is_set():
+                        break
+                    # Bump n_events_acquired so the cursor stays monotonic
+                    # when state leaves "waiting".
+                    new_state = "pausing" if handle.pause_event.is_set() else "running"
+                    handle.update(
+                        state=new_state,
+                        wait_remaining_s=None,
+                        n_events_acquired=handle.status().n_events_acquired + 1,
+                    )
+                    continue
+
                 # Status update: the feed loop committed to this RTMEvent.
                 prev = handle.status()
                 fov = rtm_event.index.get("p")
@@ -1340,6 +1393,10 @@ class Controller:
         if is_new_rtm_event:
             self._rtm_key = key
             updates["n_events_acquired"] = prev.n_events_acquired + 1
+            if prev.started_at is None:
+                # Anchor elapsed clock to first acquisition (matches _lag_origin).
+                exposure_s_for_start = (getattr(event, "exposure", None) or 0.0) / 1000.0
+                updates["started_at"] = time.monotonic() - exposure_s_for_start
             # Lag = how far this RTMEvent's acquisition start drifted from
             # its scheduled min_start_time. frameReady fires when the frame
             # *finished*, so back out the exposure to estimate the start.

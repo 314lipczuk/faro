@@ -29,8 +29,12 @@ dependencies = [
 test = [
     "pytest",
     "pytest-xdist",
-    # tests/fixtures.py imports TrackerMotile at module load, so the whole
-    # suite fails to collect without motile.
+    # The suite exercises both tracking backends; motile is the non-default
+    # one (trackpy is a core dep).
+    "faro[motile]",
+]
+
+motile = [
     "motile",
 ]
 

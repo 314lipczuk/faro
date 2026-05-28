@@ -517,7 +517,9 @@ class ImageProcessingPipeline_postExperiment:
         df_tracked = convert_track_dtypes(df_tracked)
 
         filename_for_parquet = f"{metadata['fov']}_latest.parquet"
-        if "phase_id" in metadata or "phase_name" in metadata:
+        # Key off phase_id alone (not phase_name) so phase_name-without-phase_id
+        # can't KeyError here either; mirrors pipeline.run().
+        if "phase_id" in metadata:
             metadata["fov_timestep"] = fov_obj.fov_timestep_counter
             filename_for_parquet = (
                 f"{metadata['fov']}_phase_{metadata['phase_id']}_latest.parquet"

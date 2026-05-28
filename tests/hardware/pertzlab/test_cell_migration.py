@@ -24,8 +24,8 @@ Differences from the notebook (intentional, for test ergonomics):
       server being reachable.
     * The DMD affine matrix is the synthetic identity from
       ``synthetic_affine`` — no interactive calibration step.
-    * Frame count and interval are scaled down (4 frames × 5 s) so
-      the whole test takes about a minute.
+    * Frame count and interval are scaled down (4 frames × 2 s) so
+      the whole test stays short.
 
 The test is gated by ``--scope`` / ``FARO_SCOPE`` and skipped by
 default. See ``tests/conftest.py`` for the gating logic.
@@ -56,7 +56,7 @@ from tests.hardware.pertzlab.conftest import (
 
 
 N_FRAMES = 4
-TIME_BETWEEN_TIMESTEPS_S = 5.0
+TIME_BETWEEN_TIMESTEPS_S = 2.0
 STIM_CELL_PERCENTAGE = 0.3
 
 

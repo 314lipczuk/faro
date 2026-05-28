@@ -37,7 +37,7 @@ from tests.hardware.pertzlab.conftest import assert_clean_run
 
 
 N_FRAMES = 4
-TIME_BETWEEN_TIMESTEPS_S = 5.0
+TIME_BETWEEN_TIMESTEPS_S = 2.0
 STIM_FRACTION = 0.3
 
 

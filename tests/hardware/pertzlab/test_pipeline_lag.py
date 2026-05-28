@@ -34,12 +34,16 @@ from tests.hardware.pertzlab.conftest import (
 )
 
 
-# Long enough to cover lag recovery; short enough to stay under ~2 min.
-N_FRAMES = 12
-TIME_BETWEEN_TIMESTEPS_S = 5.0
-# Pipeline artificial latency — picked to sit between one and two frame
-# intervals so the pipeline consistently lags acquisition by ~2 frames.
-SLOW_PIPELINE_DELAY_S = 7.0
+# Enough frames to build up *and* drain sustained lag, but scaled to
+# finish in well under a minute on the rig (was 12 @ 5 s + 7 s delay).
+N_FRAMES = 6
+TIME_BETWEEN_TIMESTEPS_S = 2.0
+# Pipeline artificial latency — kept between one and two frame intervals
+# (interval < delay < 2*interval) so the pipeline still consistently lags
+# acquisition by ~1.5 frames, exercising backpressure and the dispenser's
+# walk-past-skipped path. The ratio, not the absolute value, is what makes
+# this a lag test, so shrinking both keeps the coverage identical.
+SLOW_PIPELINE_DELAY_S = 3.0
 
 
 @pytest.mark.hardware

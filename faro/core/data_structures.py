@@ -847,7 +847,17 @@ def _combine_pair(
             (e.min_start_time or 0) + (e.duration_s if isinstance(e, WaitEvent) else 0)
             for e in events_a
         )
-        time_offset = max_time_a + _infer_interval(b, events_b)
+        # A WaitEvent is an *explicit* gap (its duration_s), so the inferred
+        # inter-source interval must NOT be added across a wait boundary --
+        # otherwise the wait is double-counted: the feed loop sleeps for
+        # duration_s AND the next source's min_start_time would include the
+        # wait *plus* an interval. E.g. combine(wait(10), phase) with a 10 s
+        # interval started the first acquisition at t=20 instead of t=10.
+        boundary_has_wait = isinstance(events_a[-1], WaitEvent) or isinstance(
+            events_b[0], WaitEvent
+        )
+        gap = 0.0 if boundary_has_wait else _infer_interval(b, events_b)
+        time_offset = max_time_a + gap
 
     offset_b: list[RTMEvent] = []
     for ev in events_b:

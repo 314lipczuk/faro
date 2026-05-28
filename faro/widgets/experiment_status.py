@@ -988,16 +988,18 @@ class ExperimentStatusWidget(QWidget):
             )
 
     def _tick(self) -> None:
-        """QTimer slot: refresh time-derived + queue fields between emissions."""
+        """QTimer slot: poll the handle and refresh the whole widget.
+
+        ``statusChanged`` is the push path, but its cross-thread queued
+        delivery (psygnal worker thread -> Qt main thread) proved
+        unreliable in some embeddings -- notably Jupyter notebooks --
+        leaving the strip / FOV cursor / counters frozen even though
+        ``handle.status()`` is current. Polling the latest snapshot here
+        every tick guarantees the whole widget stays live regardless of
+        signal delivery; the push connection remains as an optimisation.
+        ``_refresh``'s repaints are change-guarded, so a full refresh at
+        this cadence is cheap.
+        """
         if self._handle is None:
             return
-        # Queue depths move continuously and independently of frames -- poll
-        # them every tick, including during the finish drain so the storage
-        # queue is seen counting down to 0.
-        self._render_queue_fields()
-        status = self._handle.status()
-        # Keep the clock live while the run is active -- including while
-        # paused, since wall-clock elapsed (and thus lag) keeps growing.
-        if status.state not in ("running", "pausing", "paused", "waiting"):
-            return
-        self._render_time_fields(status, self._current_index(status))
+        self._refresh(self._handle.status())

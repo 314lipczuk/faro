@@ -35,6 +35,21 @@ def _set_c_numeric_locale():
                 continue
 
 
+def _pump_qt_events() -> None:
+    """Process pending Qt events if a Qt app is running; no-op otherwise.
+
+    Used by ``calibrate_dmd(background=True)`` to keep napari responsive
+    while the calibration MDAs run on a worker thread.
+    """
+    try:
+        from qtpy.QtCore import QCoreApplication
+    except Exception:
+        return
+    app = QCoreApplication.instance()
+    if app is not None:
+        app.processEvents()
+
+
 class KeepDMDAlive:
     def __init__(self, mmc):
         self.mmc = mmc
@@ -97,14 +112,12 @@ class Moench(PyMMCoreMicroscope):
         "power": 10,
     }
     BINNING = "2x2"
-    # ROI: full width (no x crop), symmetric top-bottom crop to ROI_HEIGHT.
-    # ROI_X / ROI_Y / ROI_WIDTH are recomputed in set_roi() against the
-    # live camera dimensions so the values stay correct under any binning.
-    # Defaults below match Prime BSI (2048 unbinned -> 1024 with 2x2).
+    # ROI applied as-is after binning — no centering recomputation.
+    # Defaults below are for Prime BSI under 2x2 binning (1024 binned px wide).
     ROI_X = 0
-    ROI_Y = 112
+    ROI_Y = 30
     ROI_WIDTH = 1024
-    ROI_HEIGHT = 800
+    ROI_HEIGHT = 792
     SET_ROI_REQUIRED = True
 
     # Devices whose Busy() flag is unreliable — waitForDevice on these
@@ -161,36 +174,72 @@ class Moench(PyMMCoreMicroscope):
         exposure=25,
         marker_style="x",
         calibration_points_DMD=None,
+        background=True,
     ):
+        """Calibrate the DMD against the camera (if not already calibrated).
+
+        Args:
+            background: When True (default), the calibration MDAs run on a
+                worker thread while this call pumps the Qt event loop, so
+                napari stays responsive and previews the calibration spots
+                live. The call still blocks until calibration finishes --
+                it just doesn't freeze the GUI. Set False to run
+                synchronously on the calling thread.
+
+        Note:
+            With ``background=True`` and ``verbose=True`` the matplotlib
+            diagnostic plots are created from the worker thread. With the
+            Jupyter inline backend this routes to the running cell fine;
+            if plots misbehave, use ``background=False`` for verbose runs.
+        """
         self.disable_log_output()
 
-        "Calibrate the DMD if it is not already calibrated." ""
-        if self.dmd is not None and self.dmd.affine is None:
+        if self.dmd is None or self.dmd.affine is not None:
+            return
+
+        def _do_calibration() -> None:
             self.wakeup_dmd.stop()
-            self.dmd.calibrate(
-                verbose=verbose,
-                n_points=n_points,
-                radius=radius,
-                exposure=exposure,
-                marker_style=marker_style,
-                calibration_points_DMD=calibration_points_DMD,
-            )
-            self.wakeup_dmd.run()
+            try:
+                self.dmd.calibrate(
+                    verbose=verbose,
+                    n_points=n_points,
+                    radius=radius,
+                    exposure=exposure,
+                    marker_style=marker_style,
+                    calibration_points_DMD=calibration_points_DMD,
+                )
+            finally:
+                self.wakeup_dmd.run()
+
+        if not background:
+            _do_calibration()
+            return
+
+        # Run on a worker thread; pump Qt here so napari keeps repainting
+        # and previewing the calibration frames. The call still blocks
+        # until calibration is done -- it just doesn't starve the GUI.
+        done = threading.Event()
+        box: list[BaseException] = []
+
+        def _worker() -> None:
+            try:
+                _do_calibration()
+            except BaseException as exc:  # noqa: BLE001
+                box.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(
+            target=_worker, name="DMDCalibration", daemon=True
+        ).start()
+        while not done.wait(timeout=0.05):
+            _pump_qt_events()
+        if box:
+            raise box[0]
 
     def set_roi(self):
-        """Apply full-width, symmetric top-bottom ROI of height ROI_HEIGHT.
-
-        Recomputes ROI_X / ROI_Y / ROI_WIDTH from the camera's live
-        full-frame dimensions under the active binning, then writes
-        them back to the instance so downstream callers reading
-        ``mic.ROI_*`` see the actual values in effect.
-        """
+        """Apply the class's ROI_* settings as-is (after binning is set)."""
         self.mmc.clearROI()
-        full_w = self.mmc.getImageWidth()
-        full_h = self.mmc.getImageHeight()
-        self.ROI_X = 0
-        self.ROI_Y = max(0, (full_h - self.ROI_HEIGHT) // 2)
-        self.ROI_WIDTH = full_w
         self.mmc.setROI(self.ROI_X, self.ROI_Y, self.ROI_WIDTH, self.ROI_HEIGHT)
 
     def post_experiment(self):

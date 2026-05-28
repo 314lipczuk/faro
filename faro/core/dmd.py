@@ -229,15 +229,20 @@ class DMD:
             )
             events.append(event_p)
 
-        self.mmc.mda.events.frameReady.disconnect()
-
+        # Connect a calibration-only frame collector. Do NOT call the
+        # no-arg frameReady.disconnect() -- that removes EVERY listener,
+        # including napari-micromanager's preview updater and the faro
+        # controller's pipeline callback, and they never come back.
+        # Connect our own handler alongside the others and disconnect
+        # only it when the collection loop is done.
         @self.mmc.mda.events.frameReady.connect
-        def new_frame(img: np.ndarray, event: MDAEvent):
+        def _collect_calibration_frame(img: np.ndarray, event: MDAEvent):
             calibration_images.append(img)
 
         for event in events:
             self.mmc.mda.run([event])
             time.sleep(0.1)
+        self.mmc.mda.events.frameReady.disconnect(_collect_calibration_frame)
         calibration_images = np.array(calibration_images)
 
         for img in calibration_images:
@@ -281,7 +286,6 @@ class DMD:
         )
 
         if np.sum(inliers) < 4:
-            self.mmc.mda.events.frameReady.disconnect()
             self.mmc.mda.run(
                 [
                     MDAEvent(
@@ -350,15 +354,14 @@ class DMD:
                 )
                 events.append(event_p)
 
-            self.mmc.mda.events.frameReady.disconnect()
-
             @self.mmc.mda.events.frameReady.connect
-            def new_frame(img: np.ndarray, event: MDAEvent):
+            def _collect_test_frame(img: np.ndarray, event: MDAEvent):
                 test_image.append(img)
 
             for event in events:
                 self.mmc.mda.run([event])
                 time.sleep(0.5)
+            self.mmc.mda.events.frameReady.disconnect(_collect_test_frame)
             calibration_images = np.array(calibration_images)
             for img in test_image:
                 img = skimage.filters.gaussian(img, sigma=1)
@@ -399,7 +402,6 @@ class DMD:
             axs[3].set_ylim(camera_height, 0)
 
             plt.show()
-        self.mmc.mda.events.frameReady.disconnect()
         self.mmc.mda.run(
             [
                 MDAEvent(

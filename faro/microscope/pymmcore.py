@@ -32,6 +32,7 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         return self.mmc.run_mda(event_iter)
 
     def connect_frame(self, callback):
+        self._check_signal_backend()
         self.mmc.mda.events.frameReady.connect(callback)
 
     def disconnect_frame(self, callback):
@@ -90,6 +91,52 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         detected = self._detected_power_properties or {}
         # Manual POWER_PROPERTIES override auto-detected ones
         return {**detected, **self.POWER_PROPERTIES}
+
+    # ------------------------------------------------------------------
+    # Internal: signal-backend safety net
+    # ------------------------------------------------------------------
+
+    def _check_signal_backend(self) -> None:
+        """Fail loud if pymmcore-plus is using the Qt MDA signal backend.
+
+        faro's async pipeline runs frameReady on the engine thread; the Qt
+        backend routes it through queued delivery to the main thread instead,
+        and the controller's pipeline silently never sees the frames. faro
+        sets ``PYMM_SIGNALS_BACKEND='psygnal'`` from ``faro/__init__.py`` so
+        any MDARunner constructed after that point is psygnal-backed -- but
+        if a CMMCorePlus.mda was already accessed before ``import faro``
+        (typically because ``import napari_micromanager`` ran first and its
+        transitive ``import pymmcore_widgets`` set the env to ``'qt'``), the
+        runner is locked Qt-backed and faro's override is too late. Detect
+        that here so the user gets a clear remediation rather than silent
+        frame loss.
+
+        Accessing ``self.mmc.mda`` lazily constructs the runner if it hasn't
+        been already, so this also doubles as a forcing function: a runner
+        built right here picks up the now-correct env.
+        """
+        if self.mmc is None:
+            return
+        sig_type = type(self.mmc.mda.events).__name__
+        if sig_type == "QMDASignaler":
+            raise RuntimeError(
+                "pymmcore-plus is using the Qt MDA signal backend "
+                f"({sig_type}), but faro's async controller pipeline requires "
+                "the synchronous psygnal backend so frameReady runs on the "
+                "engine thread regardless of the main thread's state. With "
+                "Qt-backed signals frame callbacks are queued to the main "
+                "thread and the pipeline never sees a frame.\n\n"
+                "Cause: a pymmcore-plus MDA runner was constructed before "
+                "PYMM_SIGNALS_BACKEND was set to 'psygnal'. faro/__init__.py "
+                "sets this as early as it can, but napari-micromanager "
+                "(via pymmcore_widgets) sets it to 'qt' first whenever it "
+                "imports before any faro import.\n\n"
+                "Fix: ensure `import faro` (or any `from faro...`) runs "
+                "before `import napari_micromanager` (or `import "
+                "pymmcore_widgets`). Or, as the very first line of your "
+                "notebook/script (above every import):\n\n"
+                "    import os; os.environ['PYMM_SIGNALS_BACKEND'] = 'psygnal'"
+            )
 
     def validate_hardware(self, events) -> bool:
         # Materialize once so both the base and util checks can iterate.

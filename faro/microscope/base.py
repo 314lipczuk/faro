@@ -12,21 +12,9 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
-# Force pymmcore-plus to use the psygnal signal backend regardless of whether
-# a QApplication is loaded. With "auto" (the default), pymmcore-plus picks
-# the qt backend whenever Qt is around, which routes core.mda.events.frameReady
-# through Qt.AutoConnection -- queued delivery to the main thread for any
-# non-QObject listener. The Controller's frame handler runs on the MDA engine
-# thread (no Qt objects touched); since Controller.run_experiment now spawns
-# a worker thread and Controller.RunHandle.wait() joins on that worker,
-# the main thread is typically blocked while the engine emits frames.
-# A queued Qt connection on top of that means frame callbacks pile up
-# undelivered -- the engine completes happily, but no frames reach the
-# pipeline. Forcing 'psygnal' keeps the data path direct and synchronous,
-# decoupled from any GUI loop. Widgets that subscribe to RunHandle's own
-# psygnal signals still get Qt-routed updates because *those* receivers
-# are QObjects.
-os.environ.setdefault("PYMM_SIGNALS_BACKEND", "psygnal")
+# PYMM_SIGNALS_BACKEND is hard-set to 'psygnal' in faro/__init__.py before any
+# submodule (including this one) is imported. A setdefault here would be a
+# no-op anyway: pymmcore_widgets pre-empts to 'qt' whenever it imports first.
 
 import numpy as np
 from useq import MDAEvent

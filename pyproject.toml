@@ -53,6 +53,10 @@ cellpose = [
     # so [tool.uv.sources] picks up the cu128 index pin (uv only routes
     # source overrides for packages declared as direct deps).
     "torchvision",
+    # cellpose imports cv2 but doesn't pin opencv itself; declare it here
+    # so the cellpose extra is self-sufficient (was only pulled in
+    # transitively via the virtual-microscope extra before).
+    "opencv-python",
     ]
 
 convpaint = [
@@ -99,6 +103,10 @@ torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 virtual-microscope = { git = "https://github.com/hinderling/virtual-microscope.git" }
 pymmcore-widgets = {git = "https://github.com/pymmcore-plus/pymmcore-widgets.git" }
+# PyPI napari-micromanager is 0.2.0 (no MainWindow(mmcore=...) and predates
+# the async-relevant fixes: _image_snapped race, device-leak teardown,
+# preview-during-run). Track upstream main like the other faro envs.
+napari-micromanager = { git = "https://github.com/pymmcore-plus/napari-micromanager.git", branch = "main" }
 
 [tool.pytest.ini_options]
 markers = [

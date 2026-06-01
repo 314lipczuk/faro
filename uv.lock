@@ -918,6 +918,7 @@ api75 = [
 ]
 cellpose = [
     { name = "cellpose" },
+    { name = "opencv-python" },
     { name = "torch" },
     { name = "torchvision" },
 ]
@@ -960,10 +961,11 @@ requires-dist = [
     { name = "motile", marker = "extra == 'motile'" },
     { name = "napari", extras = ["pyqt6"] },
     { name = "napari-convpaint", marker = "extra == 'convpaint'" },
-    { name = "napari-micromanager" },
+    { name = "napari-micromanager", git = "https://github.com/pymmcore-plus/napari-micromanager.git?branch=main" },
     { name = "napari-ome-zarr" },
     { name = "numpy" },
     { name = "ome-writers" },
+    { name = "opencv-python", marker = "extra == 'cellpose'" },
     { name = "opencv-python", marker = "extra == 'virtual-microscope'" },
     { name = "pandas" },
     { name = "pyarrow" },
@@ -2572,8 +2574,8 @@ wheels = [
 
 [[package]]
 name = "napari-micromanager"
-version = "0.2.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.3.1.post2.dev1+g6a927178d"
+source = { git = "https://github.com/pymmcore-plus/napari-micromanager.git?branch=main#6a927178d927a12220a62dcc9ac4c4b741b352b4" }
 dependencies = [
     { name = "fonticon-materialdesignicons6" },
     { name = "napari" },
@@ -2583,10 +2585,6 @@ dependencies = [
     { name = "tifffile" },
     { name = "useq-schema" },
     { name = "zarr" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/64/d1/09ff9bddcbd40c3e46f1c83ca532b825604dcc761ffa787a61c138356cb2/napari_micromanager-0.2.0.tar.gz", hash = "sha256:25d7e9961a24e7de3d6fc4b7b3bae4ab085d8e5811ddea73fc2d4e98f1c8d1f0", size = 23851, upload-time = "2026-02-15T19:12:02.649Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/14/fc/a02dc9aec741ead0510be8d06feea672ceef24ec3b5ea41021d4c311d9bf/napari_micromanager-0.2.0-py3-none-any.whl", hash = "sha256:6a94c3b421c1c915f4ce539c8e9bc72861ab21ba797b4cac5d491dfe25d717ac", size = 23732, upload-time = "2026-02-15T19:12:01.045Z" },
 ]
 
 [[package]]

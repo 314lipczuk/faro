@@ -32,6 +32,7 @@ test = [
     # The suite exercises both tracking backends; motile is the non-default
     # one (trackpy is a core dep).
     "faro[motile]",
+    "nbformat",
 ]
 
 motile = [

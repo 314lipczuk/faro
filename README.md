@@ -49,7 +49,8 @@ events = RTMSequence(
 
 # 4. Run!
 ctrl = Controller(mic, pipeline)
-ctrl.run_experiment(list(events), stim_mode="current")
+handle = ctrl.run_experiment(list(events), stim_mode="current")
+handle.wait()  # run_experiment is non-blocking; wait() blocks until done
 ```
 
 ## Pipeline
@@ -131,6 +132,14 @@ events = combine(setup_a, setup_b, axis="p")
 **Precondition for `axis="p"`:** all sub-experiments must declare the same imaging channels. The writer allocates a single channel set across all positions, so heterogeneous channels per FOV are not supported today (tracked for the eventual useq-schema v2 migration). A `ValueError` is raised at call time if channel configs differ.
 
 `combine()` is variadic (`combine(a, b, c, d, ..., axis=...)`), handles the N=0 and N=1 degenerate cases, and is the only composition primitive — there is deliberately no shorthand operator, so every multi-step experiment reads the composition axis explicitly.
+
+**Timed waits between phases.** `wait(seconds)` inserts a fixed-duration pause — e.g. to let cells recover before stimulating. It acquires no frames and just delays everything after it:
+
+```python
+from faro.core.data_structures import wait
+
+events = combine(baseline, wait(60), stim_phase, axis="t")
+```
 
 ### Stimulation
 
@@ -235,10 +244,24 @@ events = apply_fov_batching(events, time_per_fov=2.0)
 from faro.core.controller import Controller
 
 ctrl = Controller(mic, pipeline)
-ctrl.run_experiment(events, stim_mode="current")
+handle = ctrl.run_experiment(events, stim_mode="current")
+handle.wait()  # block until the run finishes
 ```
 
 `validate_events()` runs automatically before the experiment starts (disable with `validate=False`). It checks both pipeline compatibility and hardware limits.
+
+`run_experiment()` and `continue_experiment()` are **non-blocking** — they return a `RunHandle` so the kernel stays free (e.g. to use the napari viewer). Call `handle.wait()` to block until the run finishes.
+
+```python
+handle = ctrl.run_experiment(events, stim_mode="current")
+handle.pause(); handle.resume()   # stop/resume acquiring; schedule is preserved
+handle.cancel()                   # graceful stop
+handle.wait()                     # block until done
+
+# Live status badge, progress strip, and Pause/Stop buttons in napari:
+from faro.widgets import ExperimentStatusWidget
+viewer.window.add_dock_widget(ExperimentStatusWidget(ctrl), area="right")
+```
 
 ### Experiment Continuation
 
@@ -249,7 +272,7 @@ ctrl = Controller(mic, pipeline)
 
 # Phase 1: baseline — find cells, measure growth rate
 phase1 = RTMSequence(time_plan={"interval": 10, "loops": 60}, ...)
-ctrl.run_experiment(phase1, validate=False)
+ctrl.run_experiment(phase1, validate=False).wait()  # wait() before reading results
 
 # Analyse phase-1 results to decide what to do next
 df = pd.read_parquet("tracks/000_latest.parquet")
@@ -257,7 +280,7 @@ fast_growers = df.groupby("particle")["area"].apply(lambda x: x.diff().mean())
 
 # Phase 2: stimulate based on analysis
 phase2 = RTMSequence(time_plan={"interval": 10, "loops": 120}, ...)
-ctrl.continue_experiment(phase2)
+ctrl.continue_experiment(phase2).wait()
 
 # Always call finish_experiment() when done
 ctrl.finish_experiment()
@@ -270,12 +293,12 @@ ctrl.run_experiment(baseline_events, validate=False)  # runs in background threa
 ctrl.extend_experiment(extra_events)                   # non-blocking, appends to running acquisition
 ```
 
-| Method | When to use |
-|--------|-------------|
-| `run_experiment()` | First acquisition — creates a fresh Analyzer |
-| `continue_experiment()` | Subsequent phases — reuses Analyzer, offsets timesteps |
-| `extend_experiment()` | Mid-run additions — pushes events into the running loop |
-| `finish_experiment()` | Cleanup — shuts down Analyzer, resets state |
+| Method | When to use | Returns |
+|--------|-------------|---------|
+| `run_experiment()` | First acquisition — creates a fresh Analyzer | `RunHandle` (non-blocking) |
+| `continue_experiment()` | Subsequent phases — reuses Analyzer, offsets timesteps | `RunHandle` (non-blocking) |
+| `extend_experiment()` | Mid-run additions — pushes events into the running loop | — (non-blocking) |
+| `finish_experiment()` | Cleanup — shuts down Analyzer, resets state | — (blocks until drained) |
 
 ## Simulated Controller
 
@@ -287,7 +310,7 @@ It supports both **TIFF** (`raw/`, `ref/` folders) and **OME-Zarr** (`acquisitio
 from faro.core.controller import ControllerSimulated
 
 ctrl = ControllerSimulated(mic, pipeline, old_data_project_path="/path/to/old_experiment")
-ctrl.run_experiment(events, stim_mode="current")
+ctrl.run_experiment(events, stim_mode="current").wait()
 ```
 
 Use cases:

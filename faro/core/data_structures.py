@@ -22,6 +22,15 @@ _T = TypeVar("_T")
 StimMask = Union[np.ndarray, bool]
 
 
+class FrameWaitCancelled(Exception):
+    """Raised by :class:`FrameDispenser` wait methods after :meth:`FrameDispenser.cancel`.
+
+    Distinct from :class:`queue.Empty` (a timeout): a cancel is a
+    deliberate abort, not a failure, so callers should unwind quietly
+    rather than recording a background error.
+    """
+
+
 class FrameDispenser(Generic[_T]):
     """Frame-ordered handoff for per-frame values between pipeline workers.
 
@@ -58,6 +67,7 @@ class FrameDispenser(Generic[_T]):
         self._entries: dict[int, _T] = {}
         self._skipped: set[int] = set()
         self._cond = threading.Condition()
+        self._cancelled = False
 
     def put_for_frame(self, idx: int, value: _T) -> None:
         """Record *value* as this frame's output.
@@ -102,6 +112,11 @@ class FrameDispenser(Generic[_T]):
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             while True:
+                if self._cancelled:
+                    raise FrameWaitCancelled(
+                        f"FrameDispenser cancelled while waiting for the "
+                        f"predecessor of frame {idx}"
+                    )
                 status, info = self._resolve_predecessor_locked(idx)
                 if status == "found":
                     value = self._entries[info]
@@ -143,6 +158,10 @@ class FrameDispenser(Generic[_T]):
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             while True:
+                if self._cancelled:
+                    raise FrameWaitCancelled(
+                        f"FrameDispenser cancelled while waiting for frame {idx}"
+                    )
                 if idx in self._entries:
                     return self._entries[idx]
                 if idx in self._skipped:
@@ -180,14 +199,35 @@ class FrameDispenser(Generic[_T]):
                 if k < idx:
                     self._skipped.remove(k)
 
+    def cancel(self) -> None:
+        """Abort every blocked waiter immediately.
+
+        Sets a latch and wakes the condition variable, so any thread
+        parked in :meth:`wait_for_frame` / :meth:`get_predecessor`
+        raises :class:`FrameWaitCancelled` on its next loop pass
+        instead of sitting out the full ``timeout``. This is how an
+        experiment tears down promptly: a feed loop that would
+        otherwise wait up to ``stim_mask_timeout`` seconds for a
+        pipeline mask is released the instant the run is cancelled.
+
+        The latch persists until :meth:`reset` clears it — a cancelled
+        dispenser fails all subsequent waits.
+        """
+        with self._cond:
+            self._cancelled = True
+            self._cond.notify_all()
+
     def reset(self) -> None:
         """Clear all state. Call only when no workers are in-flight —
         waiters with ``timeout=None`` would otherwise block on a chain
         whose predecessors you just erased.
+
+        Also lifts a :meth:`cancel` latch so the dispenser is reusable.
         """
         with self._cond:
             self._entries.clear()
             self._skipped.clear()
+            self._cancelled = False
             self._cond.notify_all()
 
     def _resolve_predecessor_locked(
@@ -539,6 +579,23 @@ class RTMEvent(MDAEvent):
         return events
 
 
+class WaitEvent(RTMEvent):
+    """A timed pause of ``duration_s`` seconds; emits no MDAEvents."""
+
+    duration_s: float
+
+    def plan_events(self, **_kwargs) -> list[MDAEvent]:
+        return []
+
+
+def wait(duration_s: float, *, min_start_time: float | None = None) -> WaitEvent:
+    """Construct a :class:`WaitEvent`; composes with :func:`combine`::
+
+        events = combine(baseline, wait(60), stim, axis="t")
+    """
+    return WaitEvent(duration_s=duration_s, min_start_time=min_start_time)
+
+
 # ---------------------------------------------------------------------------
 # Frame-set helpers
 # ---------------------------------------------------------------------------
@@ -776,18 +833,40 @@ def _combine_pair(
     if not events_b:
         return events_a
 
-    max_key = max(e.index.get(axis, 0) for e in events_a) + 1
+    # WaitEvents are pure time markers: they don't claim an axis index
+    # (so subsequent t/p numbering is unaffected) but their duration_s
+    # extends the wall-clock end of the preceding sequence.
+    max_key = max(
+        (e.index.get(axis, 0) for e in events_a if not isinstance(e, WaitEvent)),
+        default=-1,
+    ) + 1
 
     time_offset = 0.0
     if offset_time:
-        max_time_a = max(e.min_start_time or 0 for e in events_a)
-        time_offset = max_time_a + _infer_interval(b, events_b)
+        max_time_a = max(
+            (e.min_start_time or 0) + (e.duration_s if isinstance(e, WaitEvent) else 0)
+            for e in events_a
+        )
+        # A WaitEvent is an *explicit* gap (its duration_s), so the inferred
+        # inter-source interval must NOT be added across a wait boundary --
+        # otherwise the wait is double-counted: the feed loop sleeps for
+        # duration_s AND the next source's min_start_time would include the
+        # wait *plus* an interval. E.g. combine(wait(10), phase) with a 10 s
+        # interval started the first acquisition at t=20 instead of t=10.
+        boundary_has_wait = isinstance(events_a[-1], WaitEvent) or isinstance(
+            events_b[0], WaitEvent
+        )
+        gap = 0.0 if boundary_has_wait else _infer_interval(b, events_b)
+        time_offset = max_time_a + gap
 
     offset_b: list[RTMEvent] = []
     for ev in events_b:
-        updates: dict = {
-            "index": {**dict(ev.index), axis: ev.index.get(axis, 0) + max_key},
-        }
+        if isinstance(ev, WaitEvent):
+            updates = {}
+        else:
+            updates = {
+                "index": {**dict(ev.index), axis: ev.index.get(axis, 0) + max_key},
+            }
         if offset_time:
             updates["min_start_time"] = (ev.min_start_time or 0) + time_offset
         offset_b.append(ev.model_copy(update=updates))
@@ -803,7 +882,7 @@ def _combine_pair(
 
 
 def combine(
-    *sources: RTMSequence | Iterable[RTMEvent],
+    *sources: RTMSequence | RTMEvent | Iterable[RTMEvent],
     axis: str = Axis.TIME,
     offset_time: bool | None = None,
 ) -> list[RTMEvent]:
@@ -853,11 +932,14 @@ def combine(
                         f"channels per position is a v2 feature."
                     )
 
-    result: list[RTMEvent] = list(sources[0])
+    def _as_list(src):
+        return [src] if isinstance(src, RTMEvent) else list(src)
+
+    result: list[RTMEvent] = _as_list(sources[0])
     for src in sources[1:]:
         result = _combine_pair(
             result,
-            src,
+            _as_list(src),
             axis=axis,
             offset_time=offset_time,
         )

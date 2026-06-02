@@ -12,6 +12,10 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
+# PYMM_SIGNALS_BACKEND is hard-set to 'psygnal' in faro/__init__.py before any
+# submodule (including this one) is imported. A setdefault here would be a
+# no-op anyway: pymmcore_widgets pre-empts to 'qt' whenever it imports first.
+
 import numpy as np
 from useq import MDAEvent
 

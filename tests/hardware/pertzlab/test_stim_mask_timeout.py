@@ -35,12 +35,12 @@ from tests.hardware.pertzlab.conftest import DelayedMaskStim
 
 
 N_FRAMES = 4
-TIME_BETWEEN_TIMESTEPS_S = 5.0
+TIME_BETWEEN_TIMESTEPS_S = 2.0
 # Pipeline sleeps much longer than the analyzer's timeout so the
 # controller is guaranteed to time out waiting for the mask. A
 # queue-based stimulator (StimWithImage / StimWithPipeline) is
 # required — base Stim is called synchronously and has no timeout.
-SLOW_PIPELINE_DELAY_S = 10.0
+SLOW_PIPELINE_DELAY_S = 3.0
 SHORT_TIMEOUT_S = 1.0
 
 

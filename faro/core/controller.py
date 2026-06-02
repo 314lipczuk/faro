@@ -1,5 +1,6 @@
 from faro.core.pipeline import store_img, ImageProcessingPipeline
-from faro.core.data_structures import FovState, ImgType, StimMode
+from faro.core.data_structures import FovState, FrameWaitCancelled, ImgType, StimMode, WaitEvent
+from faro.core.run_status import RunHandle, RunStatus
 from faro.core.writers import (
     Writer,
     TiffWriter,
@@ -12,11 +13,13 @@ from faro.core.writers import (
 )
 from faro.stimulation.base import Stim, StimWithImage, StimWithPipeline
 
+import contextlib
 import threading
 import traceback
 from dataclasses import dataclass
 from typing import Literal
 from faro.core._useq_compat import SLMImage
+from psygnal import Signal
 from useq import MDAEvent
 from queue import Queue, Empty as QueueEmpty
 import numpy as np
@@ -37,6 +40,34 @@ class BackgroundError:
     exc_type: str
     message: str
     traceback: str
+
+
+@dataclass(frozen=True)
+class QueueStats:
+    """Snapshot of the Analyzer's queue depths, for backpressure display.
+
+    The three depths each flag a distinct way the analyzer can fall
+    behind real time:
+
+    * ``storage_*``  -- images buffered in RAM awaiting a disk write.
+      Bounded; if it saturates, the camera buffer is at risk.
+    * ``pipeline_*`` -- tracking/segmentation tasks submitted to the
+      executor and not yet finished. At ``pipeline_max`` new frames
+      start being deferred instead of run inline.
+    * ``deferred_depth`` -- frames the pipeline could not keep up with,
+      queued (metadata only) to be reloaded from disk and processed
+      later. Unbounded; a steadily growing value means the pipeline is
+      permanently behind.
+    """
+
+    storage_depth: int        # images buffered, awaiting disk write
+    storage_max: int          # storage queue capacity
+    pipeline_inflight: int    # pipeline tasks submitted, not yet finished
+    pipeline_max: int         # depth at which new frames get deferred
+    deferred_depth: int       # frames deferred for later reprocessing
+    stored_images: int        # cumulative images written
+    skipped_pipeline: int     # cumulative frames deferred
+    deferred_processed: int   # cumulative deferred frames later processed
 
 
 class Analyzer:
@@ -137,6 +168,44 @@ class Analyzer:
             self.fov_states[fov_index] = FovState()
         return self.fov_states[fov_index]
 
+    def cancel_pending_waits(self) -> None:
+        """Wake any feed-loop thread parked in :meth:`get_stim_mask`.
+
+        ``get_stim_mask`` blocks on ``stim_mask_queue.wait_for_frame``
+        for up to ``stim_mask_timeout`` seconds. Cancelling the
+        dispensers makes that wait raise ``FrameWaitCancelled``
+        immediately, so a cancelled run tears down without waiting out
+        the timeout. Called (via ``Controller._cancel_stim_waits``)
+        from ``RunHandle.cancel`` on the caller's thread.
+
+        Only the stim-mask dispensers are cancelled: the tracks-queue
+        waiters run on pipeline workers that ``shutdown`` already
+        drains, and they have a file-based fallback for timeouts.
+        """
+        # Snapshot: the feed-loop thread may insert a new FovState via
+        # get_fov_state() concurrently with this iteration.
+        for fov_state in list(self.fov_states.values()):
+            fov_state.stim_mask_queue.cancel()
+
+    def queue_stats(self) -> "QueueStats":
+        """Return a thread-safe snapshot of the current queue depths.
+
+        Cheap enough to poll from a UI timer. ``Queue.qsize`` is
+        approximate under concurrency but fine for a read-out.
+        """
+        with self.task_lock:
+            inflight = self.active_pipeline_tasks
+        return QueueStats(
+            storage_depth=self._storage_queue.qsize(),
+            storage_max=self._storage_queue.maxsize,
+            pipeline_inflight=inflight,
+            pipeline_max=self.max_queue_size,
+            deferred_depth=self._deferred_queue.qsize(),
+            stored_images=self.stored_images,
+            skipped_pipeline=self.skipped_pipeline,
+            deferred_processed=self.deferred_processed,
+        )
+
     def _record_background_error(
         self, source: BackgroundErrorSource, exc: BaseException
     ) -> None:
@@ -188,6 +257,12 @@ class Analyzer:
                 mask = fov_state.stim_mask_queue.wait_for_frame(
                     frame_idx, timeout=timeout
                 )
+            except FrameWaitCancelled:
+                # Run is being cancelled — the dispenser was woken by
+                # Analyzer.cancel_pending_waits(). Unwind quietly so the
+                # feed loop reaches its cancel check; not a failure, so
+                # no background error is recorded.
+                return None
             except QueueEmpty as e:
                 # _build_stim_slm still log-and-continues with False, but
                 # hardware tests check background_errors so the dropped stim
@@ -570,6 +645,11 @@ class Controller:
 
     STOP_EVENT = object()
 
+    # Emitted on each new ``run_experiment`` / ``continue_experiment`` call,
+    # carrying the freshly-created RunHandle. Widgets subscribe to this so
+    # they can re-bind to whichever run is current.
+    runStarted = Signal(object)
+
     def __init__(self, mic, pipeline, *, writer: Writer | None = None):
         """
         Args:
@@ -577,6 +657,15 @@ class Controller:
             pipeline: ImageProcessingPipeline instance.
             writer: Storage backend. If None, Analyzer uses TiffWriter (default).
                 Pass an OmeZarrWriter for OME-Zarr output.
+
+        Note:
+            ``run_experiment`` and ``continue_experiment`` are *non-blocking*
+            in this version: they spawn a worker thread and return a
+            :class:`RunHandle` immediately. Call ``handle.wait()`` to block
+            until the run finishes, ``handle.cancel()`` to abort, or
+            subscribe to ``handle.statusChanged`` for live updates. The
+            ``runStarted`` signal on the controller fires for every new run
+            so widgets can re-bind.
         """
         self._mic = mic
         self._pipeline = pipeline
@@ -592,6 +681,7 @@ class Controller:
         self._experiment_start: float | None = None
         self._event_queue: Queue | None = None  # for extend_experiment
         self._pending_sentinels: int = 0  # number of None sentinels yet to consume
+        self._pending_sentinels_lock = threading.Lock()
         self._fov_positions: dict[int, tuple[float, float, float]] = {}
         self._pre_loop_hook: callable | None = None  # testing hook
         self._all_events: list = []  # accumulated events for JSON persistence
@@ -600,9 +690,22 @@ class Controller:
         # Survives finish_experiment() so tests/notebooks can inspect it.
         self.background_errors: list[BackgroundError] = []
 
-        # Fatal condition raised from the signal-callback thread, re-raised
-        # after the MDA drains (see _on_frame_ready + _run_mda_with_events).
+        # Fatal condition raised from the signal-callback thread, surfaced
+        # through the handle's RunStatus.fatal_error.
         self._fatal_error: BaseException | None = None
+
+        # Current run handle (None when no run is in progress / between runs).
+        # The worker thread owns it; status update sites use it via this attr.
+        self._current_handle: RunHandle | None = None
+
+        # (p, t) index of the RTMEvent whose frames are currently arriving.
+        # _bump_status_for_frame uses it to detect RTMEvent boundaries so
+        # n_events_acquired / lag update once per RTMEvent, not per frame.
+        self._rtm_key: tuple | None = None
+
+        # monotonic-clock origin for lag, anchored to the *first* frame of
+        # the run (see _bump_status_for_frame). None until that frame.
+        self._lag_origin: float | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -623,23 +726,35 @@ class Controller:
         ok = self._mic.validate_hardware(events) and ok
         return ok
 
-    def run_experiment(self, events, *, stim_mode="current", validate=True):
-        """Run an acquisition from a list of RTMEvents.
+    def run_experiment(
+        self, events, *, stim_mode="current", validate=True
+    ) -> RunHandle:
+        """Start an acquisition asynchronously. Returns immediately.
+
+        The MDA feed loop runs in a worker thread; ``RunHandle`` exposes
+        ``wait()`` / ``cancel()`` / ``status()`` and a ``statusChanged``
+        signal for live observation. There is **no** synchronous fallback —
+        callers that previously did ``ctrl.run_experiment(events)`` must
+        now do ``ctrl.run_experiment(events).wait()`` if they want the old
+        blocking semantics. ``handle.wait()`` re-raises any worker-side
+        ``fatal_error`` so the prior raise-on-failure behaviour is
+        preserved when callers explicitly opt in.
 
         Args:
-            events: Iterable of RTMEvent.  Will be materialised to a list
-                when ``validate=True`` so it can be iterated twice.
-            stim_mode: How stim masks are resolved when the stimulator needs
-                labels or images.
+            events: Iterable of RTMEvent. Materialised to a list.
+            stim_mode: How stim masks are resolved (``"current"`` /
+                ``"previous"``). See previous docstring for the gritty
+                semantics.
+            validate: Run :meth:`validate_events` before starting. Validation
+                still happens *synchronously* before the worker spawns so
+                bad event lists surface as exceptions on the calling thread.
 
-                * ``"current"`` -- acquire the imaging frame, wait for the
-                  pipeline to segment it and produce the mask, then stimulate
-                  within the same timepoint.
-                * ``"previous"`` -- stimulate using the mask produced from the
-                  *previous* timepoint (for the same FOV).
-            validate: Run :meth:`validate_events` before starting.  Set to
-                ``False`` to skip (e.g. if you already validated manually).
+        Raises:
+            RuntimeError: If a previous run is still in progress. Call
+                ``handle.wait()`` or ``handle.cancel()`` first.
+            ValueError: If ``validate=True`` and events fail validation.
         """
+        self._require_no_active_run()
         events = list(events)
         if validate:
             if not self.validate_events(events):
@@ -648,58 +763,47 @@ class Controller:
                     "Fix the issues or pass validate=False to skip."
                 )
 
-        if self._experiment_start is None:
-            self._experiment_start = time.monotonic()
+        # Sort once here so the order the worker processes them matches
+        # the order the widget displays. _run_mda_with_events also sorts
+        # (idempotent on an already-sorted list); doing it here lets us
+        # stash the canonical sequence on the handle for status widgets.
+        events = sorted(
+            events, key=lambda e: (e.min_start_time or 0, e.index.get("p", 0))
+        )
 
-        # Pre-compute offset so extend_experiment can use it during the run
-        if events:
-            self._t_offset = max(e.index.get("t", 0) for e in events) + 1
+        handle = RunHandle(
+            n_events_total=len(events),
+            events=events,
+            on_cancel=self._cancel_stim_waits,
+        )
+        self._current_handle = handle
 
-        # Persist events to storage as JSON
-        self._all_events = list(events)
-        if self._writer is not None:
-            self._writer.save_events(self._all_events)
+        handle._thread = threading.Thread(
+            target=self._run_worker,
+            args=(events, stim_mode, handle),
+            kwargs={"is_continue": False},
+            name="FaroRunWorker",
+            daemon=True,
+        )
+        handle._thread.start()
+        self.runStarted.emit(handle)
+        return handle
 
-        # Initialize writer stream with values derived from events + microscope
-        if (
-            isinstance(self._writer, OmeZarrWriter)
-            and self._writer._stream is None
-            and self._writer._raw_array is None
-        ):
-            self._writer.init_stream(
-                position_names=_extract_positions_from_events(events),
-                channel_names=_extract_channel_names_from_events(events),
-                image_height=self._mic.mmc.getImageHeight(),
-                image_width=self._mic.mmc.getImageWidth(),
-                n_timepoints=_extract_n_timepoints_from_events(events),
-                n_stim_channels=_extract_n_stim_channels_from_events(events),
-            )
+    def continue_experiment(
+        self, events, *, stim_mode="current", validate=True
+    ) -> RunHandle:
+        """Continue acquisition with new events, preserving Analyzer state.
 
-        self._analyzer = Analyzer(self._pipeline, writer=self._writer)
-        self._analyzer.stim_mode = stim_mode
-        self._validate_fov_positions(events)
-        self._run_mda_with_events(events, stim_mode=stim_mode)
-
-        # Update wall-clock offset for continuation
-        self._time_offset = time.monotonic() - self._experiment_start
-
-    def continue_experiment(self, events, *, stim_mode="current", validate=True):
-        """Continue acquisition with new events, preserving all pipeline state.
-
-        Reuses the existing ``Analyzer`` (and its ``FovState`` objects) so
-        that tracking, timestep counters, and filenames continue seamlessly
-        from the previous ``run_experiment()`` or ``continue_experiment()``
-        call.
-
-        Args:
-            events: Iterable of RTMEvent.  Timesteps and metadata will be
-                offset automatically.
-            stim_mode: Same as :meth:`run_experiment`.
-            validate: Same as :meth:`run_experiment`.
+        Same async semantics as :meth:`run_experiment`. Reuses the existing
+        ``Analyzer`` and per-FOV state so tracking and timestep counters
+        continue seamlessly across runs.
 
         Raises:
-            RuntimeError: If no previous experiment exists to continue.
+            RuntimeError: If no previous experiment exists to continue, or
+                if a run is still in progress.
+            ValueError: If ``validate=True`` and events fail validation.
         """
+        self._require_no_active_run()
         if self._analyzer is None:
             raise RuntimeError(
                 "No experiment to continue. Call run_experiment() first."
@@ -721,21 +825,147 @@ class Controller:
                 )
 
         offset_events = self._offset_events(events)
+        offset_events = sorted(
+            offset_events,
+            key=lambda e: (e.min_start_time or 0, e.index.get("p", 0)),
+        )
 
-        # Pre-compute offset so extend_experiment can use it during the run
-        if offset_events:
-            self._t_offset = max(e.index.get("t", 0) for e in offset_events) + 1
+        handle = RunHandle(
+            n_events_total=len(offset_events),
+            events=offset_events,
+            on_cancel=self._cancel_stim_waits,
+        )
+        self._current_handle = handle
 
-        # Append to accumulated events and persist
-        self._all_events.extend(offset_events)
-        if self._writer is not None:
-            self._writer.save_events(self._all_events)
+        handle._thread = threading.Thread(
+            target=self._run_worker,
+            args=(offset_events, stim_mode, handle),
+            kwargs={"is_continue": True},
+            name="FaroRunWorker",
+            daemon=True,
+        )
+        handle._thread.start()
+        self.runStarted.emit(handle)
+        return handle
 
-        self._validate_fov_positions(offset_events)
-        self._run_mda_with_events(offset_events, stim_mode=stim_mode)
+    def _require_no_active_run(self) -> None:
+        """Raise if a run is still in progress."""
+        if self._current_handle is not None and self._current_handle.is_running():
+            raise RuntimeError(
+                "An experiment is already running. Call handle.wait() or "
+                "handle.cancel() first."
+            )
 
-        # Update wall-clock offset for continuation
-        self._time_offset = time.monotonic() - self._experiment_start
+    def _cancel_stim_waits(self) -> None:
+        """RunHandle ``on_cancel`` hook — wake a feed loop blocked on a stim mask.
+
+        The feed loop checks ``handle.cancel_event`` at every iteration,
+        but while it is parked inside ``_build_stim_slm`` ->
+        ``Analyzer.get_stim_mask`` -> ``FrameDispenser.wait_for_frame``
+        it cannot poll. Without this hook a cancel issued during that
+        window would not take effect until the stim-mask timeout (up to
+        80 s) elapsed — and until the feed loop unwinds, its
+        ``finally`` block never disconnects ``_on_frame_ready``, so
+        stray frames (e.g. a later DMD calibration) keep reaching the
+        Analyzer. Cancelling the dispensers releases the wait at once.
+        """
+        analyzer = self._analyzer
+        if analyzer is not None:
+            analyzer.cancel_pending_waits()
+
+    def _get_image_size(self) -> tuple[int, int]:
+        """Return (height, width) of the microscope's camera frames.
+
+        Prefers ``self._mic.image_height`` / ``image_width`` (the
+        ``AbstractMicroscope``-level convention; ``Moench.init_scope`` and
+        peers populate them on the microscope instance). Falls back to a
+        pymmcore-plus core call when the microscope exposes one. Raises if
+        neither is available.
+        """
+        h = getattr(self._mic, "image_height", None)
+        w = getattr(self._mic, "image_width", None)
+        if h is not None and w is not None:
+            return h, w
+        mmc = getattr(self._mic, "mmc", None)
+        if mmc is not None:
+            return mmc.getImageHeight(), mmc.getImageWidth()
+        raise RuntimeError(
+            "Microscope does not expose image dimensions. Set "
+            "self.image_height / self.image_width on the microscope, or "
+            "provide a CMMCorePlus instance via self.mmc."
+        )
+
+    def _run_worker(
+        self, events, stim_mode: str, handle: RunHandle, /, *, is_continue: bool
+    ) -> None:
+        """Background-thread entry point for an experiment run.
+
+        Owns: writer init (incl. potentially-slow zarr ``rmtree`` on overwrite),
+        ``Analyzer`` construction (or reuse for continue), the feed loop, and
+        the final wall-clock offset update. All status updates flow through
+        ``handle.update`` so listeners see the progression.
+        """
+        # started_at is set on the first acquired frame (see _on_frame_ready)
+        # so a pre-acquisition WaitEvent doesn't tick elapsed/lag.
+        handle.update(state="running")
+        # Fresh RTMEvent-boundary + lag-origin trackers for this run.
+        self._rtm_key = None
+        self._lag_origin = None
+        try:
+            # ---- pre-loop setup -----------------------------------------
+            if self._experiment_start is None:
+                self._experiment_start = time.monotonic()
+
+            if events:
+                self._t_offset = max(e.index.get("t", 0) for e in events) + 1
+
+            if is_continue:
+                self._all_events.extend(events)
+            else:
+                self._all_events = list(events)
+
+            if self._writer is not None:
+                self._writer.save_events(self._all_events)
+
+            if (
+                not is_continue
+                and isinstance(self._writer, OmeZarrWriter)
+                and self._writer._stream is None
+                and self._writer._raw_array is None
+            ):
+                # NB: on a network drive an overwrite-existing init can do a
+                # multi-minute rmtree. With the feed loop on a worker thread
+                # this no longer freezes napari; status stays "running" until
+                # the actual MDA starts.
+                img_h, img_w = self._get_image_size()
+                self._writer.init_stream(
+                    position_names=_extract_positions_from_events(events),
+                    channel_names=_extract_channel_names_from_events(events),
+                    image_height=img_h,
+                    image_width=img_w,
+                    n_timepoints=_extract_n_timepoints_from_events(events),
+                    n_stim_channels=_extract_n_stim_channels_from_events(events),
+                )
+
+            if not is_continue:
+                self._analyzer = Analyzer(self._pipeline, writer=self._writer)
+                self._analyzer.stim_mode = stim_mode
+
+            self._validate_fov_positions(events)
+
+            # ---- the feed loop ------------------------------------------
+            self._run_mda_with_events(events, stim_mode=stim_mode, handle=handle)
+
+        except BaseException as exc:
+            traceback.print_exc()
+            handle.update(
+                state="error", fatal_error=exc, finished_at=time.monotonic()
+            )
+        else:
+            # Update wall-clock offset for continuation
+            if self._experiment_start is not None:
+                self._time_offset = time.monotonic() - self._experiment_start
+            handle.update(state="done", finished_at=time.monotonic())
 
     def extend_experiment(self, events):
         """Add more events to a running experiment (non-blocking).
@@ -751,8 +981,11 @@ class Controller:
 
         events = list(events)
         offset_events = self._offset_events(events)
-        # Add events + sentinel; bump counter so the loop keeps going
-        self._pending_sentinels += 1
+        # Add events + sentinel; bump counter so the loop keeps going. Lock
+        # because the feed loop now reads _pending_sentinels from the worker
+        # thread while extend_experiment runs from the caller's thread.
+        with self._pending_sentinels_lock:
+            self._pending_sentinels += 1
         for ev in offset_events:
             self._event_queue.put(ev)
         self._event_queue.put(None)  # sentinel for this batch
@@ -770,23 +1003,88 @@ class Controller:
         pipeline queues to drain before raising ``TimeoutError``. On
         timeout no teardown happens, so the call is safe to retry with
         a larger value.
+
+        If a run is still in progress this blocks until it finishes —
+        cancel it first via ``handle.cancel()`` if you want to abort.
+
+        Teardown (waiting on the run + draining the Analyzer queues) runs
+        on a worker thread; this method pumps the Qt event loop while it
+        waits, so napari stays responsive instead of freezing for the
+        whole drain.
         """
-        if self._analyzer is not None:
-            # shutdown is the gate — only snapshot background_errors and
-            # drop the Analyzer once it succeeds. On TimeoutError the
-            # Analyzer is still alive and the caller can retry.
-            self._analyzer.shutdown(wait=True, drain_timeout=drain_timeout)
-            self.background_errors.extend(self._analyzer.background_errors)
-            self._analyzer = None
-        self._t_offset = 0
-        self._time_offset = 0.0
-        self._experiment_start = None
-        self._event_queue = None
-        self._all_events.clear()
-        self._fov_positions.clear()
-        self._frame_buffers.clear()
+        done = threading.Event()
+        box: list[BaseException] = []
+
+        def _teardown() -> None:
+            try:
+                handle = self._current_handle
+                if handle is not None and handle.is_running():
+                    try:
+                        handle.wait()
+                    except BaseException as run_exc:
+                        # Remember a run-side failure but still tear down.
+                        box.append(run_exc)
+                self._current_handle = None
+
+                if self._analyzer is not None:
+                    # shutdown is the gate — only snapshot background_errors
+                    # and drop the Analyzer once it succeeds. On TimeoutError
+                    # the Analyzer is still alive and the caller can retry.
+                    self._analyzer.shutdown(
+                        wait=True, drain_timeout=drain_timeout
+                    )
+                    self.background_errors.extend(
+                        self._analyzer.background_errors
+                    )
+                    self._analyzer = None
+                self._t_offset = 0
+                self._time_offset = 0.0
+                self._experiment_start = None
+                self._event_queue = None
+                self._all_events.clear()
+                self._fov_positions.clear()
+                self._frame_buffers.clear()
+            except BaseException as exc:
+                box.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(
+            target=_teardown, name="FaroFinishWorker", daemon=True
+        ).start()
+        while not done.wait(timeout=0.05):
+            self._pump_qt_events()
+        if box:
+            raise box[0]
+
+    @staticmethod
+    def _pump_qt_events() -> None:
+        """Process pending Qt events if a Qt app is running; no-op otherwise.
+
+        Used by finish_experiment (which blocks the calling/main thread by
+        design) to keep napari responsive while teardown runs on a worker.
+        """
+        try:
+            from qtpy.QtCore import QCoreApplication
+        except Exception:
+            return
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def queue_stats(self) -> "QueueStats | None":
+        """Snapshot of the Analyzer's queue depths, or None when idle.
+
+        Returns None between experiments (no Analyzer). Status widgets
+        poll this to show storage / pipeline / deferred backpressure.
+        """
+        analyzer = self._analyzer
+        return analyzer.queue_stats() if analyzer is not None else None
 
     def stop_run(self):
+        """Hard-stop the run path (legacy). Prefer ``handle.cancel()``."""
+        if self._current_handle is not None:
+            self._current_handle.cancel()
         self._queue.put(self.STOP_EVENT)
         self._mic.cancel_mda()
         if self._analyzer is not None:
@@ -834,15 +1132,44 @@ class Controller:
                     )
             self._fov_positions[fov] = pos
 
-    def _run_mda_with_events(self, events, *, stim_mode):
-        """Run the MDA event loop — shared by run/continue_experiment."""
+    def _run_mda_with_events(self, events, *, stim_mode, handle: RunHandle):
+        """Run the MDA event loop on the worker thread.
+
+        Called from :meth:`_run_worker`. The whole body runs off the main
+        thread, so blocking primitives (``time.sleep``, ``thread.join``,
+        ``FrameDispenser.wait_for_frame``) no longer freeze napari. The
+        feed loop checks ``handle.cancel_event`` at each iteration so
+        ``handle.cancel()`` returns control without a Ctrl-C.
+        """
+        # Live mode (continuous sequence acquisition) and MDA both drive the
+        # camera. If live is still running when the MDA's first snapImage
+        # fires, the snap buffer is consumed by the live-poll listener (in
+        # napari-micromanager: _core_link._image_snapped) before the engine
+        # calls getImage, and the engine raises "Camera image buffer read
+        # failed". Stop it unconditionally before MDA starts.
+        mmc = getattr(self._mic, "mmc", None)
+        if mmc is not None and mmc.isSequenceRunning():
+            mmc.stopSequenceAcquisition()
+
         self._mic.connect_frame(self._on_frame_ready)
+
+        # Recreate the engine queue for this run. The finally-block below
+        # puts a STOP_EVENT sentinel into self._queue to stop the engine;
+        # on a *cancelled* run the engine is aborted via cancel_mda() and
+        # may stop without draining the queue, leaving stale events + the
+        # STOP sentinel behind. Reusing that queue for the next run makes
+        # the new engine consume the stale sentinel and exit almost
+        # immediately -- the feed loop keeps pushing but nothing snaps
+        # (the run "sticks" after a few events). A fresh queue per run
+        # avoids that entirely.
+        self._queue = Queue()
 
         # Set up event queue for extend_experiment support.
         # _pending_sentinels tracks how many extra batches (from
         # extend_experiment) still need to be drained.
         self._event_queue = Queue()
-        self._pending_sentinels = 0
+        with self._pending_sentinels_lock:
+            self._pending_sentinels = 0
         events = sorted(
             events, key=lambda e: (e.min_start_time or 0, e.index.get("p", 0))
         )
@@ -858,16 +1185,116 @@ class Controller:
 
         try:
             while True:
-                rtm_event = self._event_queue.get()
-                if rtm_event is None:
-                    # Sentinel consumed — stop only if no extension pending
-                    if self._pending_sentinels > 0:
-                        self._pending_sentinels -= 1
-                        continue
+                if handle.cancel_event.is_set():
                     break
 
+                # Drain the backpressure window so queued events don't keep
+                # snapping while the user adjusts hardware. min_start_times
+                # are not shifted; late events catch up on resume.
+                if handle.pause_event.is_set():
+                    held: list[MDAEvent] = []
+                    try:
+                        while True:
+                            held.append(self._queue.get_nowait())
+                    except QueueEmpty:
+                        pass
+                    handle.update(state="paused")
+                    while handle.pause_event.is_set():
+                        if handle.cancel_event.is_set():
+                            break
+                        time.sleep(0.05)
+                    for ev in held:
+                        self._queue.put(ev)
+                    if handle.cancel_event.is_set():
+                        break
+                    handle.update(state="running")
+                    continue
+
+                # Short timeout so cancellation is responsive even when
+                # the queue is empty (waiting for extend_experiment).
+                try:
+                    rtm_event = self._event_queue.get(timeout=0.1)
+                except QueueEmpty:
+                    continue
+
+                if rtm_event is None:
+                    # Sentinel consumed — stop only if no extension pending
+                    with self._pending_sentinels_lock:
+                        if self._pending_sentinels > 0:
+                            self._pending_sentinels -= 1
+                            continue
+                    break
+
+                if isinstance(rtm_event, WaitEvent):
+                    prev = handle.status()
+                    handle.update(
+                        current_event_index=dict(rtm_event.index),
+                        n_events_consumed=prev.n_events_consumed + 1,
+                    )
+                    # Feed loop runs ~3 events ahead of the engine; let
+                    # those in-flight imaging events finish before the
+                    # cursor jumps onto the wait cell.
+                    while not handle.cancel_event.is_set():
+                        s = handle.status()
+                        if s.n_events_acquired >= s.n_events_consumed - 1:
+                            break
+                        if handle.cancel_event.wait(0.05):
+                            break
+                    if handle.cancel_event.is_set():
+                        break
+
+                    base = self._experiment_start or time.monotonic()
+                    # Anchor to whichever is later: scheduled start or now.
+                    # A pause-drain can push wallclock past the scheduled
+                    # window; without max() the wait would flash through.
+                    scheduled_start = base + (rtm_event.min_start_time or 0)
+                    deadline = max(scheduled_start, time.monotonic()) + rtm_event.duration_s
+                    handle.update(state="waiting", wait_remaining_s=rtm_event.duration_s)
+                    last_displayed = int(rtm_event.duration_s)
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        # Throttle emissions to once per displayed second:
+                        # the widget renders int(remaining), so sub-second
+                        # updates only churn the Qt event queue.
+                        cur = int(remaining)
+                        if cur != last_displayed:
+                            handle.update(wait_remaining_s=remaining)
+                            last_displayed = cur
+                        if handle.cancel_event.wait(min(0.1, remaining)):
+                            break
+                    if handle.cancel_event.is_set():
+                        break
+                    # Bump n_events_acquired so the cursor stays monotonic
+                    # when state leaves "waiting".
+                    new_state = "pausing" if handle.pause_event.is_set() else "running"
+                    handle.update(
+                        state=new_state,
+                        wait_remaining_s=None,
+                        n_events_acquired=handle.status().n_events_acquired + 1,
+                    )
+                    continue
+
+                # Status update: the feed loop committed to this RTMEvent.
+                prev = handle.status()
+                fov = rtm_event.index.get("p")
+                handle.update(
+                    current_event_index=dict(rtm_event.index),
+                    current_fov=fov,
+                    n_events_consumed=prev.n_events_consumed + 1,
+                )
+
+                # Backpressure: don't get too far ahead of the MDA engine.
+                # Plain time.sleep is fine here -- this is a worker thread,
+                # not the main thread, so napari's event loop is untouched.
                 while self._queue.qsize() >= 3:
-                    time.sleep(0.1)
+                    if handle.cancel_event.is_set():
+                        break
+                    time.sleep(0.05)
+                if handle.cancel_event.is_set():
+                    break
+
                 self._n_channels = len(rtm_event.channels)
 
                 # In "previous" mode at t=0 there is no predecessor
@@ -909,9 +1336,17 @@ class Controller:
             self._event_queue = None
             self._queue.put(self.STOP_EVENT)
             if mda_thread is not None:
+                if handle.cancel_event.is_set():
+                    # Ask the engine to drop the in-flight event so the
+                    # worker thread can exit promptly.
+                    with contextlib.suppress(Exception):
+                        self._mic.cancel_mda()
                 mda_thread.join()
             self._mic.disconnect_frame(self._on_frame_ready)
 
+        # _fatal_error from a signal-callback thread surfaces through the
+        # handle's RunStatus.fatal_error -- _run_worker reads it after we
+        # return. Re-raise so the worker's try/except can record it.
         if self._fatal_error is not None:
             fatal = self._fatal_error
             self._fatal_error = None
@@ -921,10 +1356,80 @@ class Controller:
     # Frame handling
     # ------------------------------------------------------------------
 
+    def _bump_status_for_frame(self, event: MDAEvent) -> None:
+        """Update RunHandle counters for the current frame; no-op if no handle.
+
+        An RTMEvent expands into several MDAEvents (one per imaging/ref
+        channel, plus stim). This handler fires per MDAEvent, so it does
+        two different things:
+
+        * ``n_frames_received`` -- bumped on every imaging/ref frame.
+        * ``n_events_acquired`` + ``lag_ms`` -- updated only on the
+          *first* frame of each RTMEvent, detected by the (p, t) index
+          changing. So the widget's progress and the lag readout move
+          once per RTMEvent, not once per channel-frame.
+
+        Stim emissions are skipped entirely: a stim frame is the
+        SLM-illuminated snap firing alongside its imaging frame, not a
+        data frame.
+        """
+        handle = self._current_handle
+        if handle is None:
+            return
+        img_type = (event.metadata or {}).get("img_type", ImgType.IMG_RAW)
+        if img_type == ImgType.IMG_STIM:
+            return
+        prev = handle.status()
+        wallclock = time.time()
+
+        # RTMEvent boundary: (p, t) identifies one logical timepoint+FOV.
+        key = (event.index.get("p"), event.index.get("t"))
+        is_new_rtm_event = key != self._rtm_key
+
+        updates: dict = {
+            "n_frames_received": prev.n_frames_received + 1,
+            "last_frame_wallclock": wallclock,
+        }
+        if is_new_rtm_event:
+            self._rtm_key = key
+            updates["n_events_acquired"] = prev.n_events_acquired + 1
+            if prev.started_at is None:
+                # Anchor elapsed clock to first acquisition (matches _lag_origin).
+                exposure_s_for_start = (getattr(event, "exposure", None) or 0.0) / 1000.0
+                updates["started_at"] = time.monotonic() - exposure_s_for_start
+            # Lag = how far this RTMEvent's acquisition start drifted from
+            # its scheduled min_start_time. frameReady fires when the frame
+            # *finished*, so back out the exposure to estimate the start.
+            #
+            # The reference clock is anchored to the *first* frame of the
+            # run, NOT to started_at: min_start_time is relative to when
+            # the engine began acquiring, while started_at is stamped
+            # before writer init + Analyzer construction + engine/hardware
+            # startup (~1 s). Charging that constant startup to every lag
+            # reading made an on-schedule run look ~1 s behind. Anchoring
+            # to the first frame cancels it -- frame 0 reads ~0, later
+            # frames show genuine drift. Engine-agnostic: it needs only
+            # the frame callback firing plus useq's min_start_time /
+            # exposure, no engine-specific timing metadata.
+            min_start = getattr(event, "min_start_time", None)
+            if min_start is not None:
+                exposure_s = (getattr(event, "exposure", None) or 0.0) / 1000.0
+                acq_start = time.monotonic() - exposure_s
+                if self._lag_origin is None:
+                    # First frame defines t0: its acquisition start
+                    # corresponds to this event's scheduled min_start_time.
+                    self._lag_origin = acq_start - min_start
+                updates["lag_ms"] = (
+                    acq_start - self._lag_origin - min_start
+                ) * 1000.0
+        handle.update(**updates)
+
     def _on_frame_ready(self, img: np.ndarray, event: MDAEvent) -> None:
         # Drop subsequent frames after a fatal error — the MDA is winding down.
         if self._fatal_error is not None:
             return
+
+        self._bump_status_for_frame(event)
 
         meta = event.metadata or {}
         img_type = meta.get("img_type", ImgType.IMG_RAW)
@@ -1081,6 +1586,7 @@ class ControllerSimulated(Controller):
 
     def _on_frame_ready(self, img: np.ndarray, event: MDAEvent) -> None:
         """Override to load images from disk for simulated controller."""
+        self._bump_status_for_frame(event)
         meta = event.metadata or {}
         img_type = meta.get("img_type", ImgType.IMG_RAW)
 

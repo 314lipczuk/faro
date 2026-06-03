@@ -286,6 +286,10 @@ class OmeZarrWriter:
         # Label arrays created lazily on first write (one array per label name)
         self._label_arrays: dict[str, object] = {}
         self._label_lock = threading.Lock()
+        # Highest timepoint actually written to the raw / any label array;
+        # used to trim pre-sized arrays back down on close (-1 = none written).
+        self._raw_max_t: int = -1
+        self._label_max_t: int = -1
         # The pipeline runs in 4 worker threads + a storage thread; all of
         # them call writer.write(). The OME-Zarr store is sharded across
         # channels (one shard per (t, p), all channels packed in), so a
@@ -601,9 +605,52 @@ class OmeZarrWriter:
                 self._stim_pending = False
             self._stream.close()
             self._stream = None
+        # Trim pre-sized raw + label arrays down to the timepoints actually
+        # written, so a run that stops early doesn't persist phantom (all-zero)
+        # timepoints — and raw/labels keep a matching length. Time is always
+        # leading axis 0 in direct mode.
+        self._trim_arrays_to_written()
         # For direct mode, raw_array is managed by zarr (no explicit close)
         self._raw_array = None
         self._tiff.close()
+
+    @staticmethod
+    def _trim_time_axis(arr, max_t: int) -> None:
+        """Shrink ``arr``'s leading time axis to ``max_t + 1`` if oversized."""
+        if max_t < 0:
+            return
+        target_t = max_t + 1
+        if arr.shape[0] > target_t:
+            arr.resize((target_t,) + tuple(arr.shape[1:]))
+
+    def _trim_arrays_to_written(self) -> None:
+        if self._raw_array is not None:
+            self._trim_time_axis(self._raw_array, self._raw_max_t)
+        for arr in self._label_arrays.values():
+            self._trim_time_axis(arr, self._label_max_t)
+
+    def set_n_timepoints(self, n: int) -> None:
+        """Extend the declared run length, pre-sizing arrays up to ``n`` once.
+
+        Call this from a dynamic-queue / multi-phase driver when events are
+        appended past the originally declared ``n_timepoints``. It grows the
+        raw and label arrays' time axis to ``n`` in a single resize each,
+        instead of letting per-frame writes crawl the shape up one timepoint at
+        a time (which rewrites each array's ``zarr.json`` on every frame — a
+        replace-over-existing that is slow and crash-fragile on SMB shares).
+
+        No-op when ``n`` does not exceed the current declared length. Only the
+        direct (multi-position) path pre-sizes; the single-position ome-writers
+        stream grows on append and is unaffected.
+        """
+        if n <= (self._n_timepoints or 0):
+            return
+        self._n_timepoints = n
+        if self._raw_array is not None and self._raw_array.shape[0] < n:
+            self._raw_array.resize((n,) + tuple(self._raw_array.shape[1:]))
+        for arr in self._label_arrays.values():
+            if arr.shape[0] < n:
+                arr.resize((n,) + tuple(arr.shape[1:]))
 
     # ------------------------------------------------------------------
     # Raw frames → ome-writers stream
@@ -656,6 +703,7 @@ class OmeZarrWriter:
             arr[leading_idx + (slice(None, img.shape[0]), slice(None), slice(None))] = img
         elif img.ndim == 2:
             arr[leading_idx + (0, slice(None), slice(None))] = img
+        self._raw_max_t = max(self._raw_max_t, metadata.get("timestep", 0))
 
     def _write_stim(self, img: np.ndarray, metadata: dict) -> None:
         """Handle a stim readout frame."""
@@ -721,6 +769,7 @@ class OmeZarrWriter:
         leading_idx = self._leading_index(metadata)
         self._maybe_resize_leading(arr, leading_idx)
         arr[leading_idx] = frame
+        self._label_max_t = max(self._label_max_t, metadata.get("timestep", 0))
 
     def _create_label_array(self, name: str, sample_frame: np.ndarray) -> None:
         """Create an NGFF-compliant label array under the root image group.
@@ -739,7 +788,13 @@ class OmeZarrWriter:
 
         def _label_size(key: str) -> int:
             if key == Axis.TIME:
-                return 0  # grows on write
+                # Pre-size to the full experiment length when known, so the
+                # array (and its zarr.json) is written once and never resized
+                # mid-run. Resize churn is what can leave metadata truncated on
+                # a crash, and a fixed shape lets a live napari reader open the
+                # store once and see the whole time axis. Falls back to 0
+                # (grow-on-write) when unbounded.
+                return self._n_timepoints or 0
             if key == Axis.POSITION:
                 return len(self._position_names)
             return 1
@@ -1064,3 +1119,106 @@ class OmeZarrWriterPlate(OmeZarrWriter):
         label_grp.attrs["image-label"] = image_label
 
         self._label_arrays[(name, pos)] = arr
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery
+# ---------------------------------------------------------------------------
+
+
+def _true_n_timepoints(events_dir: str) -> int | None:
+    """Return ``max(t) + 1`` from ``<events_dir>/events.json``, or None."""
+    import json
+
+    path = os.path.join(events_dir, "events.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return max(d["index"].get("t", 0) for d in data) + 1
+    except (ValueError, KeyError, OSError):
+        return None
+
+
+def repair_ome_zarr_labels(
+    zarr_path: str, *, events_path: str | None = None
+) -> list[str]:
+    """Rebuild missing group metadata for an OME-Zarr ``labels`` collection.
+
+    Crash recovery for stores written by :class:`OmeZarrWriter`. A hard crash
+    can leave the label *arrays* (and their per-array ``zarr.json``) on disk
+    while the group-level ``labels/zarr.json`` and ``labels/<name>/zarr.json``
+    are missing or stale — in zarr v3 a group without a ``zarr.json`` is not a
+    valid node, so a reader finds no labels. This reconstructs them from
+    whatever arrays exist on disk; it is idempotent and safe to re-run.
+
+    When an ``events.json`` is found (next to the store, or via ``events_path``)
+    each label array's time axis is trimmed to the true timepoint count, so a
+    crashed run doesn't advertise phantom (all-zero) timepoints.
+
+    Args:
+        zarr_path: Path to the ``*.ome.zarr`` store (the image group; labels
+            live under ``<zarr_path>/labels``).
+        events_path: Directory holding ``events.json``. Defaults to the store's
+            parent directory.
+
+    Returns:
+        The label names that were repaired (sorted).
+    """
+    import zarr
+
+    labels_dir = os.path.join(zarr_path, "labels")
+    if not os.path.isdir(labels_dir):
+        return []
+
+    # Discover label images: subdirectories that hold a level-0 array.
+    names = sorted(
+        d
+        for d in os.listdir(labels_dir)
+        if os.path.exists(os.path.join(labels_dir, d, "0", "zarr.json"))
+    )
+    if not names:
+        return []
+
+    n_t = _true_n_timepoints(events_path or os.path.dirname(zarr_path))
+
+    for name in names:
+        arr = zarr.open_array(os.path.join(labels_dir, name, "0"), mode="r+")
+        if n_t is not None and arr.shape[0] > n_t:
+            arr.resize((n_t,) + tuple(arr.shape[1:]))
+
+        # Leading axes: 4D -> (t, p, y, x), 3D -> (t, y, x).
+        leading = [Axis.TIME, Axis.POSITION] if arr.ndim == 4 else [Axis.TIME]
+        axes = [
+            {"name": k, "type": _NGFF_AXIS_TYPE.get(k, "other")}
+            for k in leading + ["y", "x"]
+        ]
+        multiscales = [
+            {
+                "name": name,
+                "axes": axes,
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.0] * len(axes)}
+                        ],
+                    }
+                ],
+            }
+        ]
+        image_label = {"source": {"image": "../../"}}
+        label_grp = zarr.open_group(os.path.join(labels_dir, name), mode="a")
+        label_grp.attrs["ome"] = {
+            "version": "0.5",
+            "multiscales": multiscales,
+            "image-label": image_label,
+        }
+        label_grp.attrs["multiscales"] = multiscales  # ome-zarr-py compat
+        label_grp.attrs["image-label"] = image_label
+
+    labels_grp = zarr.open_group(labels_dir, mode="a")
+    labels_grp.attrs["ome"] = {"version": "0.5", "labels": names}
+    labels_grp.attrs["labels"] = names  # ome-zarr-py compat
+    return names

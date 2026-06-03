@@ -27,6 +27,7 @@ from faro.core.writers import (
     OmeZarrWriter,
     OmeZarrWriterPlate,
     TiffWriter,
+    repair_ome_zarr_labels,
 )
 
 
@@ -297,3 +298,134 @@ class TestOmeZarrWriterPlate:
         for i in range(self.N_POS):
             arr = zarr.open_array(str(zarr_path / "A" / str(i + 1) / "0" / "0"), mode="r")
             assert arr.shape == (N_T, len(IMG_CHANNELS), IMG_H, IMG_W)
+
+
+# ===========================================================================
+# OmeZarrWriter: label pre-sizing, dynamic extension, crash recovery
+# ===========================================================================
+
+
+class TestOmeZarrLabelPresizeAndRepair:
+    """Labels are pre-sized to the full run, extend in one shot, and survive
+    a crashed close()."""
+
+    N_POS = 2
+
+    def _crashed_store(self, tmp_dir, *, n_written: int) -> Path:
+        """Write ``n_written`` of ``N_T`` declared timepoints, then *don't*
+        close — simulating a hard crash mid-acquisition. ``events.json`` is
+        persisted (as in a real run) so repair can find the true length.
+        """
+        writer = OmeZarrWriter(tmp_dir, store_stim_images=False, n_timepoints=N_T)
+        writer.init_stream(
+            position_names=[f"Pos{i}" for i in range(self.N_POS)],
+            channel_names=IMG_CHANNELS,
+            image_height=IMG_H,
+            image_width=IMG_W,
+            n_timepoints=N_T,
+            n_stim_channels=0,
+        )
+        events = []
+        for t in range(n_written):
+            for p in range(self.N_POS):
+                writer.write(_raw(t, p), _meta(t, p), "raw")
+                writer.write(_mask(t, p), _meta(t, p), "labels")
+                events.append(
+                    RTMEvent(
+                        index={"t": t, "p": p},
+                        channels=(Channel("phase-contrast", 50),),
+                    )
+                )
+        writer.save_events(events)
+        # NOTE: no writer.close() — the crash is the whole point.
+        return Path(tmp_dir) / ZARR_DIRNAME
+
+    def test_labels_presized_to_full_length(self, tmp_dir):
+        """Before any trim, the label array spans the declared timepoints —
+        so a live napari reader sees the full time axis."""
+        store = self._crashed_store(tmp_dir, n_written=2)
+        arr = zarr.open_array(str(store / "labels" / "labels" / "0"), mode="r")
+        assert arr.shape == (N_T, self.N_POS, IMG_H, IMG_W)
+
+    def test_close_trims_raw_and_labels_consistently(self, tmp_dir):
+        """A clean close shrinks raw and labels to the same written length."""
+        writer = OmeZarrWriter(tmp_dir, store_stim_images=False, n_timepoints=N_T)
+        writer.init_stream(
+            position_names=[f"Pos{i}" for i in range(self.N_POS)],
+            channel_names=IMG_CHANNELS,
+            image_height=IMG_H,
+            image_width=IMG_W,
+            n_timepoints=N_T,
+            n_stim_channels=0,
+        )
+        for t in range(2):  # only 2 of N_T
+            for p in range(self.N_POS):
+                writer.write(_raw(t, p), _meta(t, p), "raw")
+                writer.write(_mask(t, p), _meta(t, p), "labels")
+        writer.close()
+
+        store = Path(tmp_dir) / ZARR_DIRNAME
+        labels = zarr.open_array(str(store / "labels" / "labels" / "0"), mode="r")
+        raw = zarr.open_array(str(store / "0"), mode="r")
+        assert labels.shape[0] == 2
+        assert raw.shape[0] == 2
+
+    def test_set_n_timepoints_extends_in_one_shot(self, tmp_dir):
+        """``set_n_timepoints`` grows raw + labels to the new length at once,
+        without per-frame resize churn."""
+        writer = OmeZarrWriter(tmp_dir, store_stim_images=False, n_timepoints=N_T)
+        writer.init_stream(
+            position_names=[f"Pos{i}" for i in range(self.N_POS)],
+            channel_names=IMG_CHANNELS,
+            image_height=IMG_H,
+            image_width=IMG_W,
+            n_timepoints=N_T,
+            n_stim_channels=0,
+        )
+        # First write creates the label array at the declared N_T.
+        writer.write(_raw(0, 0), _meta(0, 0), "raw")
+        writer.write(_mask(0, 0), _meta(0, 0), "labels")
+
+        writer.set_n_timepoints(2 * N_T)  # a new phase was appended at runtime
+        raw = writer._raw_array
+        labels = writer._label_arrays["labels"]
+        assert raw.shape[0] == 2 * N_T
+        assert labels.shape[0] == 2 * N_T
+        # No-op when not actually extending.
+        writer.set_n_timepoints(N_T)
+        assert writer._raw_array.shape[0] == 2 * N_T
+
+    def test_repair_rebuilds_missing_group_metadata(self, tmp_dir):
+        """After a crash with the group ``zarr.json`` files deleted, repair
+        rebuilds them, trims phantom timepoints, and leaves a readable store."""
+        store = self._crashed_store(tmp_dir, n_written=2)
+        labels_dir = store / "labels"
+
+        # Simulate the reported failure: group metadata lost, arrays intact.
+        (labels_dir / "zarr.json").unlink()
+        (labels_dir / "labels" / "zarr.json").unlink()
+        assert (labels_dir / "labels" / "0" / "zarr.json").exists()  # array kept
+
+        repaired = repair_ome_zarr_labels(str(store))
+        assert repaired == ["labels"]
+
+        # Collection group: child list restored.
+        labels_grp = zarr.open_group(str(labels_dir), mode="r")
+        assert labels_grp.attrs["ome"]["labels"] == ["labels"]
+
+        # Label image group: multiscales with the 4D (t, p, y, x) axes.
+        label_grp = zarr.open_group(str(labels_dir / "labels"), mode="r")
+        axes = [a["name"] for a in label_grp.attrs["ome"]["multiscales"][0]["axes"]]
+        assert axes == ["t", "p", "y", "x"]
+        assert "image-label" in label_grp.attrs["ome"]
+
+        # Phantom timepoints trimmed to the 2 acquired (from events.json).
+        arr = zarr.open_array(str(labels_dir / "labels" / "0"), mode="r")
+        assert arr.shape[0] == 2
+
+    def test_repair_is_idempotent(self, tmp_dir):
+        """Running repair on an already-valid store is a harmless no-op."""
+        store = self._crashed_store(tmp_dir, n_written=2)
+        first = repair_ome_zarr_labels(str(store))
+        second = repair_ome_zarr_labels(str(store))
+        assert first == second == ["labels"]

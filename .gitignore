@@ -4,6 +4,8 @@ log.txt
 .vscode/*
 .claude
 
+uv.lock
+
 # Local History for Visual Studio Code
 .history/
 

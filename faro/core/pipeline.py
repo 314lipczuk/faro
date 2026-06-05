@@ -14,7 +14,7 @@ import faro.stimulation.base as base_stimulation
 from faro.stimulation.base import StimWithImage, StimWithPipeline
 import faro.tracking.base as abstract_tracker
 import faro.feature_extraction.base as abstract_fe
-from faro.core.data_structures import FovState, ImgType, SegmentationMethod
+from faro.core.data_structures import FovState, ImgType, SegmentationMethod, WaitEvent
 from faro.core.utils import labels_to_particles, create_folders
 from datetime import datetime
 import queue
@@ -311,6 +311,8 @@ class ImageProcessingPipeline:
             stim_required = getattr(self.stimulator, "required_metadata", set())
 
         for event in events:
+            if isinstance(event, WaitEvent):
+                continue  # timed gap, carries no acquisition metadata
             meta_keys = set(event.metadata.keys())
             # General requirements (all events)
             missing = general_required - meta_keys
@@ -327,6 +329,16 @@ class ImageProcessingPipeline:
                         f"Stim event t={event.index.get('t')} p={event.index.get('p')} "
                         f"missing stim metadata: {missing_stim}"
                     )
+            # Phased-storage requirement: run() names the per-phase tracks file
+            # {fov}_phase_{phase_id}_latest.parquet and reads metadata['phase_id']
+            # directly, so phase_name without phase_id would crash storage mid-run.
+            if "phase_name" in meta_keys and "phase_id" not in meta_keys:
+                warnings_list.append(
+                    f"Event t={event.index.get('t')} p={event.index.get('p')} "
+                    f"has 'phase_name' but no 'phase_id'; add phase_id to the "
+                    f"RTMSequence rtm_metadata (the pipeline needs it to name the "
+                    f"per-phase tracks file)."
+                )
 
         if warnings_list:
             import warnings as w
@@ -379,7 +391,10 @@ class ImageProcessingPipeline:
         frame_idx = event.index.get("t", 0)
 
         filename_for_parquet = f"{metadata['fov']}_latest.parquet"
-        if "phase_id" in metadata or "phase_name" in metadata:
+        # A per-phase tracks file needs phase_id; key off it (not phase_name)
+        # so phase_name-without-phase_id can't KeyError here. validate_pipeline
+        # flags that combination up front.
+        if "phase_id" in metadata:
             metadata["fov_timestep"] = frame_idx
             filename_for_parquet = (
                 f"{metadata['fov']}_phase_{metadata['phase_id']}_latest.parquet"

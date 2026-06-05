@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 
 RunState = Literal[
-    "pending", "running", "pausing", "paused", "cancelling", "done", "error"
+    "pending", "running", "pausing", "paused", "waiting", "cancelling", "done", "error"
 ]
 
 
@@ -50,16 +50,19 @@ class RunStatus:
     # / n_events_total, NOT n_frames_received / n_events_total.
     n_events_total: int = 0          # how many RTMEvents the run was started with
     n_events_consumed: int = 0       # RTMEvents pulled by the feed loop so far
-    n_events_acquired: int = 0       # RTMEvents whose first frame has arrived
+    n_events_acquired: int = 0       # RTMEvents whose first frame has arrived (WaitEvents bump on completion)
     n_frames_received: int = 0       # MDAEvent frames acknowledged via frameReady
     # Timing.
-    started_at: float | None = None       # time.monotonic() when the worker began
+    started_at: float | None = None       # time.monotonic() when the first frame began acquiring
     finished_at: float | None = None      # time.monotonic() when the worker exited
     last_frame_wallclock: float | None = None
     # Lag: how late the *current RTMEvent* started acquiring vs its
     # scheduled min_start_time, in ms. Measured once per RTMEvent (on its
     # first frame), not per channel-frame. Positive == behind schedule.
     lag_ms: float | None = None
+    # Seconds left on an active WaitEvent countdown. Non-None only while
+    # state == "waiting"; cleared back to None when the wait ends.
+    wait_remaining_s: float | None = None
     # Pipeline / storage backpressure visibility (best-effort).
     pipeline_inflight: int = 0
     storage_queue_depth: int = 0

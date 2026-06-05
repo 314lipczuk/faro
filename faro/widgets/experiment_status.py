@@ -52,7 +52,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from faro.core.data_structures import ImgType
+from faro.core.data_structures import ImgType, WaitEvent
 from faro.core.run_status import RunHandle, RunStatus
 
 if TYPE_CHECKING:
@@ -67,6 +67,7 @@ EVENT_COLORS: dict[str, str] = {
     "imaging": "#2e7d32",
     "stim":    "#1565c0",
     "ref":     "#ef6c00",
+    "wait":    "#9e9e9e",
 }
 DEFAULT_EVENT_COLOR = "#888888"
 
@@ -84,6 +85,7 @@ _PAST_ALPHA        = 255
 _BORDER_PX         = 2
 _GAP_PX            = 1
 _MIN_GAP_AT_CELL_W = 3.0
+_WAIT_HATCH_MIN_W  = 8.0   # min cell width (px) to overlay the wait hatch
 
 # FOV map
 _DOT_RADIUS_PX     = 5
@@ -112,15 +114,17 @@ _BAR_FILL_WARN     = "rgba(229, 57, 53, 130)"    # _LAG_BAD_COLOR, translucent
 # ─────────────────────────────────────────────────────────────────────────
 
 def _event_type_token(ev) -> str:
-    """Map an RTMEvent to one of {"ref", "stim", "imaging"} for visualisation.
+    """Map an RTMEvent to one of {"wait", "ref", "stim", "imaging"} for visualisation.
 
     Order of precedence matches what the user sees as the *dominant* effect
-    for that timepoint: ref > stim > imaging.
+    for that timepoint: wait > ref > stim > imaging.
 
     RTMEvent doesn't expose ``stim`` / ``ref`` booleans directly --
     ``events_to_dataframe`` derives them from the channel tuple lengths,
     so we do the same here.
     """
+    if isinstance(ev, WaitEvent):
+        return "wait"
     if getattr(ev, "ref_channels", ()):
         return "ref"
     if getattr(ev, "stim_channels", ()):
@@ -218,7 +222,7 @@ def _chip_style(color_hex: str, *, active: bool) -> str:
             f"padding: 2px 8px; border-radius: {_RADIUS_PX}px; font-weight: bold;"
         )
     return (
-        f"background-color: rgba({r},{g},{b},60); color: rgba({r},{g},{b},180); "
+        f"background-color: rgba({r},{g},{b},60); color: rgba({r},{g},{b},105); "
         f"padding: 2px 8px; border-radius: {_RADIUS_PX}px; font-weight: bold;"
     )
 
@@ -339,24 +343,32 @@ class EventStrip(QWidget):
         def x_for(i: int) -> float:
             return i * stride
 
-        def width_for(span: int) -> float:
-            return max(cell_w * span + max(0, span - 1) * gap, 1.0)
+        def _fill_run(start: int, end: int, t: str, alpha: int) -> None:
+            color = QColor(EVENT_COLORS.get(t, DEFAULT_EVENT_COLOR))
+            color.setAlpha(alpha)
+            # Span to the next run's start so phase boundaries don't leave
+            # the trailing inter-cell gap visible (within a run the merged
+            # fill already covers those gaps).
+            x0 = x_for(start)
+            x1 = min(x_for(end), float(w))
+            rect = QRectF(x0, 0, x1 - x0, h)
+            # Solid base keeps thin cells visible; a bare hatch over a
+            # 1-2px wide wait cell renders as near-transparent and reads
+            # as a gap. Overlay the hatch only when wide enough to show.
+            painter.fillRect(rect, color)
+            if t == "wait" and rect.width() >= _WAIT_HATCH_MIN_W:
+                hatch = QColor(0, 0, 0, alpha // 3)
+                painter.fillRect(rect, QBrush(hatch, Qt.BrushStyle.BDiagPattern))
 
         # Future / dim layer
         for start, end, t in _runs(self._types):
-            color = QColor(EVENT_COLORS.get(t, DEFAULT_EVENT_COLOR))
-            color.setAlpha(_FUTURE_ALPHA)
-            painter.fillRect(QRectF(x_for(start), 0, width_for(end - start), h), color)
+            _fill_run(start, end, t, _FUTURE_ALPHA)
 
         # Past + current overlay
         if self._current >= 0:
             past_end = min(self._current + 1, n)
             for start, end, t in _runs(self._types[:past_end]):
-                color = QColor(EVENT_COLORS.get(t, DEFAULT_EVENT_COLOR))
-                color.setAlpha(_PAST_ALPHA)
-                painter.fillRect(
-                    QRectF(x_for(start), 0, width_for(end - start), h), color
-                )
+                _fill_run(start, end, t, _PAST_ALPHA)
 
         # Active border
         if 0 <= self._current < n:
@@ -364,9 +376,10 @@ class EventStrip(QWidget):
             pen = QPen(QColor(EVENT_COLORS.get(t, DEFAULT_EVENT_COLOR)).darker(160))
             pen.setWidth(_BORDER_PX)
             painter.setPen(pen)
-            visible_w = max(cell_w, 3.0)
-            x = self._current * stride
-            x = min(max(0.0, x - (visible_w - cell_w) / 2), w - visible_w)
+            x0 = x_for(self._current)
+            cell = min(x_for(self._current + 1), float(w)) - x0
+            visible_w = max(cell, 3.0)
+            x = min(max(0.0, x0 - (visible_w - cell) / 2), w - visible_w)
             painter.drawRect(QRectF(x + 0.5, 0.5, visible_w - 1, h - 1))
 
 
@@ -566,7 +579,7 @@ class ExperimentStatusWidget(QWidget):
         legend_row = QHBoxLayout()
         legend_row.setContentsMargins(0, 0, 0, 0)
         legend_row.setSpacing(6)
-        for label, key in [("imaging", "imaging"), ("stim", "stim"), ("ref", "ref")]:
+        for label, key in [("imaging", "imaging"), ("stim", "stim"), ("ref", "ref"), ("wait", "wait")]:
             chip = QLabel(label)
             chip.setStyleSheet(_chip_style(EVENT_COLORS[key], active=False))
             self._legend_chips[key] = chip
@@ -746,6 +759,10 @@ class ExperimentStatusWidget(QWidget):
             self._handle.resume()
         else:
             self._handle.pause()
+        # statusChanged may not fire if state didn't transition (pause
+        # during "waiting" defers the state flip until the wait ends),
+        # so refresh the label locally to keep it in sync.
+        self._update_buttons(self._handle.status().state)
 
     # -- refresh ------------------------------------------------------------
 
@@ -765,6 +782,8 @@ class ExperimentStatusWidget(QWidget):
         # to DONE before the finish drain completes.
         if self._finishing:
             self._state_label.setText("STOPPING...")
+        elif status.state == "waiting" and status.wait_remaining_s is not None:
+            self._state_label.setText(f"WAITING {format_duration(status.wait_remaining_s)}")
         else:
             self._state_label.setText(status.state.upper())
 
@@ -776,8 +795,11 @@ class ExperimentStatusWidget(QWidget):
             t = self._event_types[cur_idx]
             color = EVENT_COLORS.get(t, DEFAULT_EVENT_COLOR)
             self._strip.set_current(cur_idx)
-            fov_for_event = self._event_fovs[cur_idx]
-            self._map.set_current(fov_for_event, color=color)
+            if t == "wait":  # no FOV
+                self._map.set_current(-1)
+            else:
+                fov_for_event = self._event_fovs[cur_idx]
+                self._map.set_current(fov_for_event, color=color)
             self._update_legend(active_type=t)
         else:
             self._strip.set_current(-1)
@@ -815,15 +837,13 @@ class ExperimentStatusWidget(QWidget):
 
     def _update_buttons(self, state: str) -> None:
         """Enable/label Pause + Stop according to the run state."""
-        # Pause/Resume is meaningful only while the run is live.
-        live = state in ("running", "pausing", "paused")
+        live = state in ("running", "pausing", "paused", "waiting")
         self._pause_btn.setEnabled(live)
-        if state in ("paused", "pausing"):
-            self._pause_btn.setText("Resume")
-        else:
-            self._pause_btn.setText("Pause")
-        # Stop is meaningful while running OR paused (cancel breaks the
-        # pause-wait too).
+        # Drive the label off pause_event so a click during "waiting"
+        # flips to Resume immediately, even though state stays "waiting"
+        # until the wait completes.
+        paused = self._handle is not None and self._handle.is_paused()
+        self._pause_btn.setText("Resume" if paused else "Pause")
         self._stop_btn.setEnabled(live)
 
     def _render_idle(self) -> None:
@@ -856,7 +876,12 @@ class ExperimentStatusWidget(QWidget):
         events ahead of the engine because of the backpressure window,
         which would make the strip jump). Both ``_refresh`` and the
         ``_tick`` QTimer call this so they always agree on "current".
+        While ``waiting``, ``n_events_acquired`` doesn't bump (no frame
+        arrives for a WaitEvent), so use ``n_events_consumed`` to keep
+        the cursor on the wait cell during the countdown.
         """
+        if status.state == "waiting" and status.n_events_consumed > 0:
+            return status.n_events_consumed - 1
         return status.n_events_acquired - 1 if status.n_events_acquired > 0 else -1
 
     def _render_time_fields(self, status: RunStatus, cur_idx: int) -> None:
@@ -963,16 +988,18 @@ class ExperimentStatusWidget(QWidget):
             )
 
     def _tick(self) -> None:
-        """QTimer slot: refresh time-derived + queue fields between emissions."""
+        """QTimer slot: poll the handle and refresh the whole widget.
+
+        ``statusChanged`` is the push path, but its cross-thread queued
+        delivery (psygnal worker thread -> Qt main thread) proved
+        unreliable in some embeddings -- notably Jupyter notebooks --
+        leaving the strip / FOV cursor / counters frozen even though
+        ``handle.status()`` is current. Polling the latest snapshot here
+        every tick guarantees the whole widget stays live regardless of
+        signal delivery; the push connection remains as an optimisation.
+        ``_refresh``'s repaints are change-guarded, so a full refresh at
+        this cadence is cheap.
+        """
         if self._handle is None:
             return
-        # Queue depths move continuously and independently of frames -- poll
-        # them every tick, including during the finish drain so the storage
-        # queue is seen counting down to 0.
-        self._render_queue_fields()
-        status = self._handle.status()
-        # Keep the clock live while the run is active -- including while
-        # paused, since wall-clock elapsed (and thus lag) keeps growing.
-        if status.state not in ("running", "pausing", "paused"):
-            return
-        self._render_time_fields(status, self._current_index(status))
+        self._refresh(self._handle.status())

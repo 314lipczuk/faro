@@ -579,6 +579,23 @@ class RTMEvent(MDAEvent):
         return events
 
 
+class WaitEvent(RTMEvent):
+    """A timed pause of ``duration_s`` seconds; emits no MDAEvents."""
+
+    duration_s: float
+
+    def plan_events(self, **_kwargs) -> list[MDAEvent]:
+        return []
+
+
+def wait(duration_s: float, *, min_start_time: float | None = None) -> WaitEvent:
+    """Construct a :class:`WaitEvent`; composes with :func:`combine`::
+
+        events = combine(baseline, wait(60), stim, axis="t")
+    """
+    return WaitEvent(duration_s=duration_s, min_start_time=min_start_time)
+
+
 # ---------------------------------------------------------------------------
 # Frame-set helpers
 # ---------------------------------------------------------------------------
@@ -816,18 +833,40 @@ def _combine_pair(
     if not events_b:
         return events_a
 
-    max_key = max(e.index.get(axis, 0) for e in events_a) + 1
+    # WaitEvents are pure time markers: they don't claim an axis index
+    # (so subsequent t/p numbering is unaffected) but their duration_s
+    # extends the wall-clock end of the preceding sequence.
+    max_key = max(
+        (e.index.get(axis, 0) for e in events_a if not isinstance(e, WaitEvent)),
+        default=-1,
+    ) + 1
 
     time_offset = 0.0
     if offset_time:
-        max_time_a = max(e.min_start_time or 0 for e in events_a)
-        time_offset = max_time_a + _infer_interval(b, events_b)
+        max_time_a = max(
+            (e.min_start_time or 0) + (e.duration_s if isinstance(e, WaitEvent) else 0)
+            for e in events_a
+        )
+        # A WaitEvent is an *explicit* gap (its duration_s), so the inferred
+        # inter-source interval must NOT be added across a wait boundary --
+        # otherwise the wait is double-counted: the feed loop sleeps for
+        # duration_s AND the next source's min_start_time would include the
+        # wait *plus* an interval. E.g. combine(wait(10), phase) with a 10 s
+        # interval started the first acquisition at t=20 instead of t=10.
+        boundary_has_wait = isinstance(events_a[-1], WaitEvent) or isinstance(
+            events_b[0], WaitEvent
+        )
+        gap = 0.0 if boundary_has_wait else _infer_interval(b, events_b)
+        time_offset = max_time_a + gap
 
     offset_b: list[RTMEvent] = []
     for ev in events_b:
-        updates: dict = {
-            "index": {**dict(ev.index), axis: ev.index.get(axis, 0) + max_key},
-        }
+        if isinstance(ev, WaitEvent):
+            updates = {}
+        else:
+            updates = {
+                "index": {**dict(ev.index), axis: ev.index.get(axis, 0) + max_key},
+            }
         if offset_time:
             updates["min_start_time"] = (ev.min_start_time or 0) + time_offset
         offset_b.append(ev.model_copy(update=updates))
@@ -843,7 +882,7 @@ def _combine_pair(
 
 
 def combine(
-    *sources: RTMSequence | Iterable[RTMEvent],
+    *sources: RTMSequence | RTMEvent | Iterable[RTMEvent],
     axis: str = Axis.TIME,
     offset_time: bool | None = None,
 ) -> list[RTMEvent]:
@@ -893,11 +932,14 @@ def combine(
                         f"channels per position is a v2 feature."
                     )
 
-    result: list[RTMEvent] = list(sources[0])
+    def _as_list(src):
+        return [src] if isinstance(src, RTMEvent) else list(src)
+
+    result: list[RTMEvent] = _as_list(sources[0])
     for src in sources[1:]:
         result = _combine_pair(
             result,
-            src,
+            _as_list(src),
             axis=axis,
             offset_time=offset_time,
         )

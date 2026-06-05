@@ -10,7 +10,7 @@ import warnings
 
 import pytest
 
-from faro.core.data_structures import Channel, PowerChannel, RTMEvent
+from faro.core.data_structures import Channel, PowerChannel, RTMEvent, wait
 from faro.core.utils import validate_hardware
 
 from tests.fake_mmc import build_validation_core as _core
@@ -66,6 +66,12 @@ class TestChannelConfigExistence:
 
         assert result is False
         assert any("nonexistent-laser" in str(warning.message) for warning in w)
+
+    def test_wait_event_ignored(self):
+        """A WaitEvent has no channels and must not trip config checks."""
+        mmc = _core()
+        events = _make_events(channels=[Channel("phase-contrast", 50)]) + [wait(5.0)]
+        assert validate_hardware(events, mmc) is True
 
     def test_multiple_groups_searched(self):
         """Config can be in any group — not just 'Channel'."""

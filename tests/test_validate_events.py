@@ -23,6 +23,7 @@ from faro.core.data_structures import (
     RTMEvent,
     RTMSequence,
     SegmentationMethod,
+    wait,
 )
 from faro.core.pipeline import ImageProcessingPipeline
 from faro.segmentation.base import Segmentator
@@ -344,6 +345,15 @@ class TestRequiredMetadata:
     def test_fe_metadata_present_passes(self, tmp_path_cleanup):
         pipeline = _make_pipeline(tmp_path_cleanup, fe=FENeedsThreshold())
         events = _make_events(metadata={"fe_threshold": 0.5})
+        assert pipeline.validate_pipeline(events) is True
+
+    def test_wait_event_skips_metadata_check(self, tmp_path_cleanup):
+        """A WaitEvent carries no metadata and must not trip the
+        required-metadata check that applies to acquired events."""
+        pipeline = _make_pipeline(
+            tmp_path_cleanup, tracker=TrackerNeedsCondition(),
+        )
+        events = _make_events(metadata={"condition": "control"}) + [wait(5.0)]
         assert pipeline.validate_pipeline(events) is True
 
     # --- Multiple components with metadata requirements ---

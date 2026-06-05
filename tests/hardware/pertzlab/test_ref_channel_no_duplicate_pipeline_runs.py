@@ -36,7 +36,7 @@ from tests.hardware.pertzlab.conftest import (
 
 
 N_FRAMES = 4
-TIME_BETWEEN_TIMESTEPS_S = 5.0
+TIME_BETWEEN_TIMESTEPS_S = 2.0
 
 
 @pytest.mark.hardware

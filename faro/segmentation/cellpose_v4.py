@@ -18,11 +18,13 @@ class CellposeV4(Segmentator):
         cellprob_threshold: float = 0.0,
         min_size: int = 50,
         gpu: bool = True,
+        gamma: float = 1.0,
     ):
 
         self.flow_threshold = flow_threshold
         self.cellprob_threshold = cellprob_threshold
         self.min_size = min_size
+        self.gamma = gamma
 
         if custom_model_path is None:
             self.model = models.CellposeModel(gpu=gpu)
@@ -42,6 +44,8 @@ class CellposeV4(Segmentator):
         self._eval_lock = threading.Lock()
 
     def segment(self, image: np.ndarray) -> np.ndarray:
+        if self.gamma != 1.0:
+            image = image**self.gamma
 
         with self._eval_lock:
             masks, flows, styles = self.model.eval(

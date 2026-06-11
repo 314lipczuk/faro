@@ -24,6 +24,7 @@ import zarr
 
 from faro.core.data_structures import Channel, RTMEvent
 from faro.core.writers import (
+    OmeZarrRawReader,
     OmeZarrWriter,
     OmeZarrWriterPlate,
     TiffWriter,
@@ -220,6 +221,117 @@ class TestOmeZarrWriterMultiPosition:
             for p in range(self.N_POS):
                 expected = 50_000 + t * 100 + p
                 assert raw[t, p, 0, t % IMG_H, p % IMG_W] == expected
+
+
+# ===========================================================================
+# OmeZarrWriter.read_raw — deferred-pipeline reload path
+# ===========================================================================
+
+
+class TestOmeZarrReadRaw:
+    """``read_raw`` must round-trip the imaging channels of a written frame.
+
+    This is the backend hook the deferred-pipeline path uses to reload a frame
+    whose in-RAM copy was dropped under overload. It must (a) work mid-run
+    (before close), (b) return imaging channels only — stim readout stripped,
+    and (c) be correct for direct (multi-pos), stream (single-pos), and plate
+    layouts.
+    """
+
+    def _writer(self, cls, tmp_dir, n_pos):
+        writer = cls(tmp_dir, store_stim_images=True, n_timepoints=N_T)
+        writer.init_stream(
+            position_names=[f"Pos{i}" for i in range(n_pos)],
+            channel_names=IMG_CHANNELS,
+            image_height=IMG_H,
+            image_width=IMG_W,
+            n_timepoints=N_T,
+            n_stim_channels=STIM_CHANNELS,
+        )
+        return writer
+
+    @pytest.mark.parametrize(
+        "cls,n_pos",
+        [
+            (OmeZarrWriter, 1),  # single-position stream path
+            (OmeZarrWriter, 3),  # multi-position direct path
+            (OmeZarrWriterPlate, 3),  # plate / per-well path
+        ],
+    )
+    def test_read_raw_roundtrips_imaging_channels(self, cls, n_pos, tmp_dir):
+        writer = self._writer(cls, tmp_dir, n_pos)
+        try:
+            _write_full_run(writer, n_pos=n_pos)
+            # Reload mid-run (writer still open), exactly as the deferred worker
+            # does once pipeline capacity frees up.
+            for t in range(N_T):
+                for p in range(n_pos):
+                    got = writer.read_raw(_meta(t, p))
+                    # Imaging channels only — the stim channel must be stripped.
+                    assert got.shape == (len(IMG_CHANNELS), IMG_H, IMG_W)
+                    np.testing.assert_array_equal(got, _raw(t, p))
+        finally:
+            writer.close()
+
+
+class TestOmeZarrRawReader:
+    """The shared reader must read a *closed* store from a path alone.
+
+    This is the offline re-analysis usage (ControllerSimulated / pipeline_post):
+    no live writer, just the store on disk. Same layout coverage as the live
+    read, plus the stim-stripping option used by re-analysis.
+    """
+
+    def _write_closed_store(self, cls, tmp_dir, n_pos):
+        writer = cls(tmp_dir, store_stim_images=True, n_timepoints=N_T)
+        writer.init_stream(
+            position_names=[f"Pos{i}" for i in range(n_pos)],
+            channel_names=IMG_CHANNELS,
+            image_height=IMG_H,
+            image_width=IMG_W,
+            n_timepoints=N_T,
+            n_stim_channels=STIM_CHANNELS,
+        )
+        _write_full_run(writer, n_pos=n_pos)
+        writer.close()
+        return Path(tmp_dir) / ZARR_DIRNAME
+
+    @pytest.mark.parametrize(
+        "cls,n_pos",
+        [
+            (OmeZarrWriter, 1),  # single-position stream
+            (OmeZarrWriter, 3),  # multi-position direct
+            (OmeZarrWriterPlate, 3),  # plate / per-well
+        ],
+    )
+    def test_reads_all_channels_by_default(self, cls, n_pos, tmp_dir):
+        path = self._write_closed_store(cls, tmp_dir, n_pos)
+        reader = OmeZarrRawReader(str(path))
+        for t in range(N_T):
+            for p in range(n_pos):
+                got = reader.read(t, p)
+                # No stripping requested → imaging + stim channels present.
+                assert got.shape == (len(IMG_CHANNELS) + STIM_CHANNELS, IMG_H, IMG_W)
+                np.testing.assert_array_equal(got[: len(IMG_CHANNELS)], _raw(t, p))
+
+    @pytest.mark.parametrize(
+        "cls,n_pos",
+        [
+            (OmeZarrWriter, 1),
+            (OmeZarrWriter, 3),
+            (OmeZarrWriterPlate, 3),
+        ],
+    )
+    def test_strips_stim_channels_when_requested(self, cls, n_pos, tmp_dir):
+        path = self._write_closed_store(cls, tmp_dir, n_pos)
+        reader = OmeZarrRawReader(str(path))
+        for t in range(N_T):
+            for p in range(n_pos):
+                got = reader.read(
+                    t, p, n_imaging_channels=len(IMG_CHANNELS)
+                )
+                assert got.shape == (len(IMG_CHANNELS), IMG_H, IMG_W)
+                np.testing.assert_array_equal(got, _raw(t, p))
 
 
 # ===========================================================================

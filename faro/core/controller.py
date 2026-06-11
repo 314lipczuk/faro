@@ -6,6 +6,7 @@ from faro.core.writers import (
     TiffWriter,
     OmeZarrWriter,
     OmeZarrWriterPlate,
+    OmeZarrRawReader,
     _extract_positions_from_events,
     _extract_channel_names_from_events,
     _extract_n_timepoints_from_events,
@@ -136,8 +137,12 @@ class Analyzer:
         )
         self._storage_thread.start()
 
-        # Deferred pipeline queue: metadata-only (images loaded from disk when processing)
-        # Stores (event, metadata, folder) tuples instead of full images to save RAM
+        # Deferred pipeline queue: metadata-only. Frames that arrive while the
+        # pipeline is saturated drop their in-RAM pixels and queue just the
+        # event/metadata; the pixels are reloaded from storage when capacity
+        # frees up (see _deferred_worker). This caps peak RAM at the in-flight
+        # set rather than growing with the backlog. The reload goes through the
+        # writer backend (writer.read_raw) so it works for TIFF *and* OME-Zarr.
         self._deferred_queue: Queue = Queue()
         self._deferred_thread = threading.Thread(
             target=self._deferred_worker, daemon=True, name="DeferredWorker"
@@ -409,7 +414,9 @@ class Analyzer:
             if self.active_pipeline_tasks >= self.max_queue_size:
                 # Pipeline is overloaded - defer this image for later processing
                 self.skipped_pipeline += 1
-                # Queue for deferred processing (metadata only, image will be loaded from disk)
+                # Queue metadata only — the image is reloaded from storage in
+                # _deferred_worker (via writer.read_raw) so we don't hold the
+                # full backlog of frames in RAM.
                 try:
                     self._deferred_queue.put_nowait((event, metadata, folder))
                     if self.debug:
@@ -434,7 +441,9 @@ class Analyzer:
             future = self.executor.submit(
                 self.pipeline.run, img=img, event=event, file_path=None
             )
-            future.add_done_callback(lambda f: self._pipeline_task_done(future=f))
+            future.add_done_callback(
+                self._make_pipeline_done_callback(event, metadata)
+            )
             if self.debug:
                 print(
                     f"[Analyzer] Pipeline submitted (active={self.active_pipeline_tasks}, pending_deferred={self._deferred_queue.qsize()})"
@@ -480,24 +489,41 @@ class Analyzer:
                     # Capacity available (or shutting down) - increment counter
                     self.active_pipeline_tasks += 1
 
-                # Construct file path to load image from disk
-                fname = metadata["fname"]
-                file_path = os.path.join(
-                    self.pipeline.storage_path, "raw", fname + ".tiff"
-                )
+                # Reload the frame's pixels from storage through the writer
+                # backend. This is the crux of the deferral design: the in-RAM
+                # array was dropped at defer time to bound memory, so it must be
+                # read back from wherever it was written — a per-frame TIFF for
+                # TiffWriter, or the OME-Zarr store for OmeZarrWriter. Asking the
+                # writer (rather than hardcoding raw/<fname>.tiff) keeps this
+                # correct across backends.
+                try:
+                    img = self.writer.read_raw(metadata)
+                except Exception as e:
+                    with self.task_lock:
+                        self.active_pipeline_tasks -= 1
+                    # The frame can't be reloaded (missing/not flushed/backend
+                    # without read support). Record the cause first, then mark
+                    # the frame skipped so downstream get_predecessor waiters
+                    # resolve — ordering the skip last means anything observing
+                    # "frame resolved" also sees the recorded error.
+                    self._record_background_error("deferred", e)
+                    fov_idx = metadata.get("fov", 0)
+                    frame_idx = event.index.get("t", 0)
+                    self.get_fov_state(fov_idx).tracks_queue.skip_frame(frame_idx)
+                    continue
 
-                # Submit deferred image to pipeline (will load from disk)
+                # Submit deferred image to pipeline (loaded above).
                 try:
                     future = self.executor.submit(
-                        self.pipeline.run, img=None, event=event, file_path=file_path
+                        self.pipeline.run, img=img, event=event, file_path=None
                     )
                     future.add_done_callback(
-                        lambda f: self._pipeline_task_done(future=f)
+                        self._make_pipeline_done_callback(event, metadata)
                     )
                     self.deferred_processed += 1
                     if self.debug:
                         print(
-                            f"[Analyzer] Deferred submitted (loading from {file_path}, deferred_processed={self.deferred_processed})"
+                            f"[Analyzer] Deferred submitted (deferred_processed={self.deferred_processed})"
                         )
                 except (RuntimeError, OSError):
                     with self.task_lock:
@@ -534,11 +560,27 @@ class Analyzer:
 
         return {"result": "STOP"}
 
-    def _pipeline_task_done(self, future=None):
+    def _make_pipeline_done_callback(self, event: MDAEvent, metadata: dict):
+        """Build a Future done-callback bound to this frame's event/metadata.
+
+        Capturing the frame's identity lets the callback release a downstream
+        waiter if ``pipeline.run`` raised *before* reaching its own
+        dispenser-skipping ``finally`` (e.g. an error during image load or
+        frame setup). Without that, the tracks dispenser never resolves this
+        frame and every later frame's ``get_predecessor`` blocks until it
+        times out — the "FrameDispenser: timeout waiting for frame N" symptom.
+        """
+        return lambda f: self._pipeline_task_done(
+            future=f, event=event, metadata=metadata
+        )
+
+    def _pipeline_task_done(self, future=None, event=None, metadata=None):
         """Called when pipeline task completes.
 
         Args:
             future: The Future object from the executor (if provided as callback arg)
+            event: The frame's MDAEvent, used on error to release downstream waiters.
+            metadata: The frame's metadata, used on error to resolve its FOV.
         """
         with self.task_lock:
             self.active_pipeline_tasks -= 1
@@ -549,6 +591,23 @@ class Analyzer:
                 future.result()  # This will re-raise any exception that occurred
             except Exception as e:
                 self._record_background_error("pipeline", e)
+                # The pipeline's own `finally` skips the tracks dispenser when a
+                # frame fails mid-run, but only once it has reached that block.
+                # An exception raised earlier (e.g. before frame setup) leaves
+                # the frame unresolved, hanging every downstream predecessor
+                # wait. Mark it skipped here as a backstop — skip never
+                # overrides a real put (wait_for_frame/get_predecessor check
+                # entries first), so this is safe even if the pipeline already
+                # produced tracks before failing later.
+                if event is not None and metadata is not None:
+                    try:
+                        fov_idx = metadata.get("fov", 0)
+                        frame_idx = event.index.get("t", 0)
+                        self.get_fov_state(fov_idx).tracks_queue.skip_frame(
+                            frame_idx
+                        )
+                    except Exception:
+                        pass
 
         if self.debug:
             print(
@@ -1554,35 +1613,14 @@ class ControllerSimulated(Controller):
         super().__init__(mic, pipeline, writer=writer)
         self._project_path = old_data_project_path
 
-        # Detect OME-Zarr source
+        # Detect OME-Zarr source. Raw read-back goes through the same
+        # OmeZarrRawReader the live writer uses, so the store-layout knowledge
+        # (direct / single-position / plate) lives in exactly one place.
         zarr_path = os.path.join(old_data_project_path, "acquisition.ome.zarr")
         if os.path.isdir(zarr_path):
-            import zarr
-
-            self._zarr_store = zarr.open_group(zarr_path, mode="r")
-            self._zarr_raw = self._zarr_store["0"]
-            ome = self._zarr_store.attrs.get("ome", {})
-            axes = ome.get("multiscales", [{}])[0].get("axes", [])
-            self._zarr_axes = [a["name"] for a in axes]
+            self._zarr_reader: OmeZarrRawReader | None = OmeZarrRawReader(zarr_path)
         else:
-            self._zarr_store = None
-
-    def _read_zarr_raw(self, timestep: int, fov: int) -> np.ndarray:
-        """Read a raw frame from the zarr store, returning (c, y, x)."""
-        axes = self._zarr_axes
-        has_p = "p" in axes
-        has_c = "c" in axes
-        arr = self._zarr_raw
-
-        if has_p and has_c:
-            img = np.asarray(arr[timestep, fov])
-        elif has_p:
-            img = np.asarray(arr[timestep, fov])[np.newaxis]
-        elif has_c:
-            img = np.asarray(arr[timestep])
-        else:
-            img = np.asarray(arr[timestep])[np.newaxis]
-        return img
+            self._zarr_reader = None
 
     def _on_frame_ready(self, img: np.ndarray, event: MDAEvent) -> None:
         """Override to load images from disk for simulated controller."""
@@ -1607,8 +1645,12 @@ class ControllerSimulated(Controller):
             t_idx = event.index.get("t", 0)
             p_idx = event.index.get("p", 0)
 
-            if img_type == ImgType.IMG_RAW and self._zarr_store is not None:
-                img_loaded = self._read_zarr_raw(t_idx, p_idx)
+            if img_type == ImgType.IMG_RAW and self._zarr_reader is not None:
+                # Strip stim-readout channels (if any) so re-analysis sees the
+                # same imaging-only frame the live pipeline received.
+                img_loaded = self._zarr_reader.read(
+                    t_idx, p_idx, n_imaging_channels=len(meta.get("channels", ()))
+                )
             else:
                 # TIFF fallback (raw/) or always for ref images
                 folder = {

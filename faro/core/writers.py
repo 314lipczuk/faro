@@ -59,6 +59,20 @@ class Writer(Protocol):
         """
         ...
 
+    def read_raw(self, metadata: dict) -> np.ndarray:
+        """Read back a previously written raw frame as ``(c, y, x)``.
+
+        Used by the deferred-pipeline path: under pipeline overload the in-RAM
+        frame is dropped and reloaded later from storage, so the reload must go
+        through whichever backend wrote it. Returns only the imaging channels
+        (stim readout channels stripped), matching what was passed to
+        ``write(img, metadata, "raw")``.
+
+        Args:
+            metadata: Event metadata (must contain 'fname', 'fov', 'timestep').
+        """
+        ...
+
     def save_events(self, events) -> None:
         """Save acquisition events as ``events.json`` in the storage path."""
         ...
@@ -98,6 +112,12 @@ class TiffWriter:
             img,
             compression="zlib",
             compressionargs={"level": 5},
+        )
+
+    def read_raw(self, metadata: dict) -> np.ndarray:
+        fname = metadata["fname"]
+        return tifffile.imread(
+            os.path.join(self.storage_path, "raw", fname + ".tiff")
         )
 
     def save_events(self, events) -> None:
@@ -184,6 +204,79 @@ def _growable_dim_indices(axis_keys: list[str]) -> tuple[int, ...]:
     by the event list at open time.
     """
     return tuple(i for i, k in enumerate(axis_keys) if k == Axis.TIME)
+
+
+class OmeZarrRawReader:
+    """Read-only access to raw imaging frames in an OME-Zarr acquisition store.
+
+    Single home for the store-layout knowledge so that every "reload a raw
+    frame from disk" caller shares one implementation instead of re-deriving
+    indexing from axes metadata. Two consumers:
+
+    - the live deferred-pipeline reload (:meth:`OmeZarrWriter.read_raw`), and
+    - offline re-analysis (``ControllerSimulated``).
+
+    Handles the three layouts faro writes:
+
+    - direct multi-position — root ``"0"`` array, axes ``(t, p, c, y, x)``
+    - single-position stream — root ``"0"`` array, axes ``(t, c, y, x)``
+    - plate — one array per well at ``"<well>/0/0"``, axes ``(t, c, y, x)``,
+      ordered by ``(rowIndex, columnIndex)`` to match FOV index.
+
+    Opens the store read-only. Concurrent with a live writer this is safe for
+    already-written frames; the deferred path only ever reloads frames older
+    than the most recent write, which are flushed by the time they are read.
+    """
+
+    def __init__(self, zarr_path: str):
+        import zarr
+
+        self._root = zarr.open_group(zarr_path, mode="r")
+        ome = dict(self._root.attrs).get("ome", {})
+        plate = ome.get("plate")
+        if plate is not None:
+            self._is_plate = True
+            wells = sorted(
+                plate.get("wells", []),
+                key=lambda w: (w.get("rowIndex", 0), w.get("columnIndex", 0)),
+            )
+            # Each well holds a single field "0"; its raw array is "<well>/0/0".
+            self._well_arrays = [f"{w['path']}/0/0" for w in wells]
+        else:
+            self._is_plate = False
+            self._raw = self._root["0"]
+            axes = ome.get("multiscales", [{}])[0].get("axes", [])
+            self._axes = [a["name"] for a in axes]
+
+    def read(
+        self, timestep: int, fov: int, *, n_imaging_channels: int | None = None
+    ) -> np.ndarray:
+        """Return raw frame ``(c, y, x)`` for ``(timestep, fov)``.
+
+        If ``n_imaging_channels`` is given, trailing stim-readout channels are
+        stripped so callers get imaging channels only.
+        """
+        if self._is_plate:
+            frame = np.asarray(self._root[self._well_arrays[fov]][timestep])
+        else:
+            has_p = "p" in self._axes
+            has_c = "c" in self._axes
+            arr = self._raw
+            if has_p and has_c:
+                frame = np.asarray(arr[timestep, fov])
+            elif has_p:
+                frame = np.asarray(arr[timestep, fov])[np.newaxis]
+            elif has_c:
+                frame = np.asarray(arr[timestep])
+            else:
+                frame = np.asarray(arr[timestep])[np.newaxis]
+        if (
+            n_imaging_channels
+            and frame.ndim == 3
+            and frame.shape[0] > n_imaging_channels
+        ):
+            frame = frame[:n_imaging_channels]
+        return frame
 
 
 class OmeZarrWriter:
@@ -597,6 +690,58 @@ class OmeZarrWriter:
                         time.sleep(_WRITE_RETRY_BASE_DELAY * (2 ** attempt))
             assert last_err is not None
             raise last_err
+
+    def read_raw(self, metadata: dict) -> np.ndarray:
+        """Read back a raw frame's imaging channels as ``(c, y, x)``.
+
+        Two storage modes:
+        - Multi-position *direct* mode keeps a live, random-access zarr array
+          (``self._raw_array``); we index it directly, so there is no reopen
+          and no flush-timing concern.
+        - Single-position *stream* mode appends through ome-writers; the raw
+          data lands at the store's root ``"0"`` array on disk, which we open
+          read-only. Deferred frames are always older than the most recent
+          write, so they are flushed by the time they are reloaded.
+
+        Held under ``_write_lock``: this runs on the deferred-pipeline thread
+        concurrently with acquisition writes, and zarr-python's shared sync
+        loop is not safe to drive from a reader thread while writer threads are
+        mid-flush (it surfaces as "cannot schedule new futures after shutdown").
+        The writer already serializes every write through this lock, so taking
+        it here makes raw read-back mutually exclusive with writes. Reads are
+        fast and deferral is the catch-up path, so the added contention is
+        negligible.
+        """
+        with self._write_lock:
+            if self._raw_array is not None:
+                leading_idx = self._leading_index(metadata)
+                frame = np.asarray(self._raw_array[leading_idx])
+            else:
+                frame = np.asarray(self._read_raw_from_disk(metadata))
+        return self._strip_stim_channels(frame)
+
+    def _read_raw_from_disk(self, metadata: dict) -> np.ndarray:
+        """Read a raw frame from the on-disk store. ``(c, y, x)``, stim kept.
+
+        Delegates layout handling to :class:`OmeZarrRawReader`, which covers the
+        stream and plate layouts alike. A fresh reader is opened per call so it
+        always sees the current (growing) store shape. Stim stripping is done by
+        the caller (:meth:`read_raw`), so we read all channels here.
+        """
+        t = int(metadata.get("timestep", 0))
+        p = int(metadata.get("fov", 0))
+        return OmeZarrRawReader(self._zarr_path).read(t, p)
+
+    def _strip_stim_channels(self, frame: np.ndarray) -> np.ndarray:
+        """Drop trailing stim-readout channels so callers get imaging only.
+
+        The raw array packs imaging channels followed by stim channels; the
+        ``write(..., "raw")`` input was imaging-only, so reads must match.
+        """
+        n_img = self._n_imaging_channels
+        if frame.ndim == 3 and n_img and frame.shape[0] > n_img:
+            return frame[:n_img]
+        return frame
 
     def close(self) -> None:
         if self._stream is not None:
@@ -1018,6 +1163,10 @@ class OmeZarrWriterPlate(OmeZarrWriter):
     def _write_raw(self, img: np.ndarray, metadata: dict) -> None:
         """Plate always uses the ome-writers stream (no direct mode)."""
         self._write_raw_stream(img, metadata)
+
+    # Raw read-back (deferred reload) is inherited from OmeZarrWriter: its
+    # _read_raw_from_disk uses OmeZarrRawReader, which auto-detects the plate
+    # layout from the store's ome metadata — no plate-specific override needed.
 
     # ------------------------------------------------------------------
     # Label writing — per-well (each well has its own label groups)

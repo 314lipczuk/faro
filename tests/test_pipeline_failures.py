@@ -27,6 +27,7 @@ import tifffile
 from faro.core.controller import Controller
 from faro.core.data_structures import SegmentationMethod
 from faro.core.pipeline import ImageProcessingPipeline
+from faro.core.writers import OmeZarrWriter
 from faro.feature_extraction.simple import SimpleFE
 from faro.segmentation.base import OtsuSegmentator
 from faro.stimulation.center_circle import CenterCircle
@@ -148,6 +149,231 @@ class TestStressSlowSegmentation:
             labels = tifffile.imread(os.path.join(labels_dir, f))
             unique = set(np.unique(labels)) - {0}
             assert len(unique) == 2, f"{f}: expected 2 labels, got {len(unique)}"
+
+
+class _RecordingPipeline:
+    """Minimal pipeline stub that records how ``run`` was invoked."""
+
+    def __init__(self, storage_path):
+        self.storage_path = storage_path
+        self.segmentators = ["seg"]  # non-None so the pipeline runs
+        self.stimulator = None
+        self._analyzer = None
+        self._writer = None
+        self.calls = []
+        self._lock = threading.Lock()
+        self.seen = threading.Event()
+
+    def run(self, img=None, event=None, file_path=None):
+        with self._lock:
+            self.calls.append({"img": img, "file_path": file_path})
+        self.seen.set()
+        return {}
+
+
+class TestDeferredReloadsViaWriter:
+    """Regression: deferred frames reload through the writer backend, never via
+    a hardcoded ``raw/<fname>.tiff``.
+
+    The old deferred path built ``storage_path/raw/<fname>.tiff`` unconditionally
+    and let ``pipeline.run`` imread it. With the OME-Zarr writer that TIFF never
+    exists (raw frames live in the zarr store), so every deferred frame died
+    with ``FileNotFoundError`` — and because such a frame never resolves its
+    tracks dispenser, downstream frames then hung with "FrameDispenser: timeout
+    waiting for frame N". The fix routes the reload through ``writer.read_raw``,
+    which each backend implements against its own store.
+    """
+
+    def test_deferred_frame_reloads_via_writer_read_raw(self, tmp_dir):
+        from types import SimpleNamespace
+
+        from faro.core.controller import Analyzer
+
+        sentinel = np.full((1, 8, 8), 7, dtype=np.uint16)
+
+        class _FakeZarrWriter:
+            """Stand-in for a non-TIFF backend: no ``raw/*.tiff`` on disk."""
+
+            storage_path = tmp_dir
+
+            def __init__(self):
+                self.read_calls = []
+
+            def write(self, img, metadata, folder):
+                pass
+
+            def read_raw(self, metadata):
+                self.read_calls.append(metadata["fname"])
+                return sentinel
+
+            def save_events(self, events):
+                pass
+
+            def close(self):
+                pass
+
+        writer = _FakeZarrWriter()
+        pipeline = _RecordingPipeline(tmp_dir)
+        analyzer = Analyzer(
+            pipeline, max_workers=1, max_queue_size=4, writer=writer
+        )
+        try:
+            event = SimpleNamespace(index={"t": 3})
+            metadata = {"fname": "003_00042", "fov": 3, "timestep": 3}
+
+            # Enqueue exactly as _try_submit_pipeline does when overloaded.
+            analyzer._deferred_queue.put((event, metadata, "raw"))
+
+            assert pipeline.seen.wait(timeout=5), "deferred frame was never run"
+            assert analyzer.wait_idle(timeout=5)
+
+            # Reload went through the backend, not a reconstructed TIFF path.
+            assert writer.read_calls == ["003_00042"]
+            assert len(pipeline.calls) == 1
+            call = pipeline.calls[0]
+            assert call["file_path"] is None
+            assert np.array_equal(call["img"], sentinel)
+            assert analyzer.background_errors == []
+        finally:
+            analyzer.shutdown(wait=False)
+
+    def test_unreloadable_deferred_frame_is_skipped_not_hung(self, tmp_dir):
+        """If the reload fails, the frame is marked skipped so downstream
+        ``get_predecessor`` waiters resolve instead of timing out."""
+        from types import SimpleNamespace
+
+        from faro.core.controller import Analyzer
+
+        class _FailingWriter:
+            storage_path = tmp_dir
+
+            def write(self, img, metadata, folder):
+                pass
+
+            def read_raw(self, metadata):
+                raise FileNotFoundError("frame not in store")
+
+            def save_events(self, events):
+                pass
+
+            def close(self):
+                pass
+
+        pipeline = _RecordingPipeline(tmp_dir)
+        analyzer = Analyzer(
+            pipeline, max_workers=1, max_queue_size=4, writer=_FailingWriter()
+        )
+        try:
+            event = SimpleNamespace(index={"t": 5})
+            metadata = {"fname": "000_00005", "fov": 0, "timestep": 5}
+            analyzer._deferred_queue.put((event, metadata, "raw"))
+
+            # Frame 5 must resolve as skipped (not left unresolved) so that
+            # downstream waiters don't block forever. wait_for_frame returns
+            # None for a skipped frame, or raises queue.Empty on timeout.
+            fov_state = analyzer.get_fov_state(0)
+            assert fov_state.tracks_queue.wait_for_frame(5, timeout=5) is None
+            assert any(
+                e.source == "deferred" for e in analyzer.background_errors
+            )
+            # The unreloadable frame was never handed to the pipeline.
+            assert pipeline.calls == []
+        finally:
+            analyzer.shutdown(wait=False)
+
+
+class TestDeferredReloadFromRealOmeZarr:
+    """The deferred reload pulls the *right* pixels from a real OME-Zarr store.
+
+    Exercises the genuine defer→reload mechanism — the real deferred queue and
+    the real deferred_worker calling the real ``OmeZarrWriter.read_raw`` — but
+    drives the queue directly so the result is deterministic (no dependence on
+    pipeline timing / tracking ordering, which is a separate concern). This is
+    the exact path that crashed in production with
+    ``FileNotFoundError: …/raw/<fname>.tiff`` on the OME-Zarr backend.
+
+    Parametrized over single-position (stream layout → disk read-back) and
+    multi-position (direct layout → live-array read-back).
+    """
+
+    N_T = 4
+
+    @staticmethod
+    def _frame(t: int, p: int) -> np.ndarray:
+        """A (1, y, x) frame with a value unique to (t, p) for identification."""
+        f = np.zeros((1, 16, 16), dtype=np.uint16)
+        f[0, t, p] = 1000 + 100 * t + p
+        return f
+
+    @pytest.mark.parametrize("n_pos", [1, 2])
+    def test_deferred_frame_reloads_its_own_pixels(self, n_pos, tmp_dir):
+        from types import SimpleNamespace
+
+        from faro.core.controller import Analyzer
+
+        writer = OmeZarrWriter(tmp_dir, store_stim_images=False, n_timepoints=self.N_T)
+        writer.init_stream(
+            position_names=[f"Pos{p}" for p in range(n_pos)],
+            channel_names=["phase-contrast"],
+            image_height=16,
+            image_width=16,
+            n_timepoints=self.N_T,
+            n_stim_channels=0,
+        )
+
+        recorded: list[tuple] = []
+        lock = threading.Lock()
+
+        class _RecordingPipeline:
+            def __init__(self, storage_path):
+                self.storage_path = storage_path
+                self.segmentators = ["seg"]  # non-None so the pipeline runs
+                self.stimulator = None
+                self._analyzer = None
+                self._writer = None
+
+            def run(self, img=None, event=None, file_path=None):
+                with lock:
+                    recorded.append(
+                        (event.index.get("t"), event.index.get("p"), img)
+                    )
+                return {}
+
+        pipeline = _RecordingPipeline(tmp_dir)
+        analyzer = Analyzer(
+            pipeline, max_workers=1, max_queue_size=4, writer=writer
+        )
+        try:
+            # Write each raw frame to the store exactly as the storage worker
+            # would, then enqueue it on the deferred queue (pixels dropped — only
+            # metadata is kept, to be reloaded from the store).
+            metas = {}
+            for t in range(self.N_T):
+                for p in range(n_pos):
+                    meta = {
+                        "timestep": t,
+                        "fov": p,
+                        "fname": f"{p:03d}_{t:05d}",
+                    }
+                    metas[(t, p)] = meta
+                    writer.write(self._frame(t, p), meta, "raw")
+            for t in range(self.N_T):
+                for p in range(n_pos):
+                    event = SimpleNamespace(index={"t": t, "p": p})
+                    analyzer._deferred_queue.put((event, metas[(t, p)], "raw"))
+
+            assert analyzer.wait_idle(timeout=15), "deferred queue never drained"
+        finally:
+            analyzer.shutdown(wait=False)
+
+        assert analyzer.background_errors == []
+        assert len(recorded) == self.N_T * n_pos
+        # Each deferred frame was reloaded from the store with ITS OWN pixels —
+        # the reload is wired to the right backend and the right (t, p) index.
+        for t, p, img in recorded:
+            assert img is not None, f"frame t={t} p={p} reloaded as None"
+            assert img.shape == (1, 16, 16)
+            assert img[0, t, p] == 1000 + 100 * t + p, f"wrong pixels for t={t} p={p}"
 
 
 # ===================================================================

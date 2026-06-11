@@ -26,7 +26,12 @@ from faro.core.pipeline import (
     convert_track_dtypes,
     save_segmentation_results,
 )
-from faro.core.writers import Writer, TiffWriter, OmeZarrWriter
+from faro.core.writers import (
+    Writer,
+    TiffWriter,
+    OmeZarrWriter,
+    OmeZarrRawReader,
+)
 
 
 class ImageProcessingPipeline_postExperiment:
@@ -78,12 +83,16 @@ class ImageProcessingPipeline_postExperiment:
         if self._use_zarr:
             import zarr
 
+            # Raw frames are read through the shared OmeZarrRawReader (one home
+            # for store-layout knowledge). The store handle + axes are still
+            # kept here for the label reader below, which is a separate concern.
+            self._zarr_reader: OmeZarrRawReader | None = OmeZarrRawReader(zarr_path)
             self._zarr_store = zarr.open(zarr_path, mode="r")
-            self._zarr_raw = self._zarr_store["0"]
             ome = self._zarr_store.attrs.get("ome", {})
             axes = ome.get("multiscales", [{}])[0].get("axes", [])
             self._zarr_axes = [a["name"] for a in axes]
         else:
+            self._zarr_reader = None
             self._zarr_store = None
 
         # When using an OmeZarrWriter, folder creation is handled by the
@@ -121,20 +130,7 @@ class ImageProcessingPipeline_postExperiment:
 
     def _read_zarr_raw(self, timestep: int, fov: int) -> np.ndarray:
         """Read a raw frame from the zarr store, returning (c, y, x) array."""
-        axes = self._zarr_axes
-        has_p = "p" in axes
-        has_c = "c" in axes
-        arr = self._zarr_raw
-
-        if has_p and has_c:
-            img = np.asarray(arr[timestep, fov])  # (c, y, x)
-        elif has_p:
-            img = np.asarray(arr[timestep, fov])[np.newaxis]  # (1, y, x)
-        elif has_c:
-            img = np.asarray(arr[timestep])  # (c, y, x)
-        else:
-            img = np.asarray(arr[timestep])[np.newaxis]  # (1, y, x)
-        return img
+        return self._zarr_reader.read(timestep, fov)
 
     def _read_zarr_label(
         self, label_name: str, timestep: int, fov: int

@@ -1,6 +1,5 @@
 import numpy as np
-from .base import Segmentator
-import skimage
+from .base import Segmentator, remove_small_objects
 import imaging_server_kit as sk
 import time
 
@@ -48,7 +47,7 @@ class SegmentatorImagingServerKit(Segmentator):
 
         if self.min_size > 0:
             # remove cells below threshold
-            labels = skimage.morphology.remove_small_objects(
+            labels = remove_small_objects(
                 labels, min_size=self.min_size, connectivity=1
             )
         return labels

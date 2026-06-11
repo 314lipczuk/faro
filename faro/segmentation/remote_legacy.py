@@ -1,6 +1,5 @@
 import numpy as np
-from faro.segmentation.base import Segmentator
-import skimage
+from faro.segmentation.base import Segmentator, remove_small_objects
 import imaging_server_kit
 
 """
@@ -37,7 +36,7 @@ class SegmentatorImagingServerKitLegacy(Segmentator):
         labels = self.client.run_algorithm(self.algorithm, **params)[0][0]
         if self.min_size > 0:
             # remove cells below threshold
-            labels = skimage.morphology.remove_small_objects(
+            labels = remove_small_objects(
                 labels, min_size=self.min_size, connectivity=1
             )
         return labels

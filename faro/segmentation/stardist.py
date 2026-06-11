@@ -1,6 +1,5 @@
 import numpy as np
-from faro.segmentation.base import Segmentator
-import skimage
+from faro.segmentation.base import Segmentator, remove_small_objects
 import csbdeep
 from stardist.models import StarDist2D
 import matplotlib.pyplot as plt
@@ -59,7 +58,7 @@ class SegmentatorStardist(Segmentator):
 
         if self.min_size > 0:
             # remove cells below threshold
-            labels = skimage.morphology.remove_small_objects(
+            labels = remove_small_objects(
                 labels, min_size=self.min_size, connectivity=1
             )
         return labels

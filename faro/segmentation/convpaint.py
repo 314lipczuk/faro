@@ -1,5 +1,5 @@
 import numpy as np
-from .base import Segmentator
+from .base import Segmentator, remove_small_objects
 import skimage
 from napari_convpaint import conv_paint, conv_paint_utils
 
@@ -43,7 +43,7 @@ class SegmentatorConvpaint(Segmentator):
             )
         labels = skimage.morphology.label(labels)
         if self.min_cell_size > 0:
-            labels = skimage.morphology.remove_small_objects(
+            labels = remove_small_objects(
                 labels, min_size=self.min_cell_size
             )
         return labels

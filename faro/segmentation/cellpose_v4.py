@@ -4,8 +4,7 @@ import warnings
 warnings.filterwarnings("ignore", message="Sparse invariant checks")
 
 import numpy as np
-from faro.segmentation.base import Segmentator
-import skimage
+from faro.segmentation.base import Segmentator, remove_small_objects
 from cellpose import models
 
 
@@ -56,7 +55,7 @@ class CellposeV4(Segmentator):
 
         if self.min_size > 0:
             # remove cells below threshold
-            masks = skimage.morphology.remove_small_objects(
+            masks = remove_small_objects(
                 masks, min_size=self.min_size, connectivity=1
             )
         return masks

@@ -2,7 +2,7 @@ import pymmcore_plus
 import weakref
 
 from faro.microscope.pymmcore import PyMMCoreMicroscope
-from faro.core.data_structures import ImgType
+from faro.core.data_structures import ImgType, PowerChannel
 from faro.core.dmd import DMD
 from faro.core._useq_compat import SLMImage
 from pymmcore_plus.mda._engine import MDAEngine
@@ -120,13 +120,12 @@ class Moench(PyMMCoreMicroscope):
         "miRFP": ("LED", "Red_Level"),        # state 32, inferred from cfg labels
         "mCitrine": ("LED", "Teal_Level"),    # state 8,  inferred from cfg labels
     }
-    DMD_CALIBRATION_PROFILE = {
-        "channel_group": "TTL_ERK",
-        "channel_config": "CyanStim",
-        "device_name": "LED",
-        "property_name": "Cyan_Level",
-        "power": 10,
-    }
+    # DMD calibration light path. The (device, property) for the power come
+    # from POWER_PROPERTIES["CyanStim"] via resolve_power, so they aren't
+    # duplicated here.
+    DMD_CALIBRATION_CHANNEL = PowerChannel(
+        config="CyanStim", group="TTL_ERK", power=10
+    )
     BINNING = "2x2"
     # ROI applied as-is after binning — no centering recomputation.
     # Defaults below are for Prime BSI under 2x2 binning (1024 binned px wide).
@@ -173,7 +172,8 @@ class Moench(PyMMCoreMicroscope):
         self.slm_height = self.mmc.getSLMHeight(self.slm_dev)
         self.dmd = DMD(
             self.mmc,
-            self.DMD_CALIBRATION_PROFILE,
+            self.DMD_CALIBRATION_CHANNEL,
+            resolve_power=self.resolve_power,
             affine_matrix=self.affine_calibration_matrix,
         )
         self.wakeup_dmd = KeepDMDAlive(self.mmc)

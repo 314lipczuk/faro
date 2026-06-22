@@ -23,19 +23,31 @@ class DMD:
     def __init__(
         self,
         mmc: CMMCorePlus,
-        calibration_profile,
+        calibration_channel,
+        resolve_power=None,
         affine_matrix=None,
         test_mode: bool = False,
     ):
         """Args:
         mmc: core object from CMMCorePlus()
+        calibration_channel: a ``Channel``/``PowerChannel`` describing the
+            light path used to image the DMD spots during calibration. The
+            channel's ``config``/``group`` set the MDA channel; for a
+            ``PowerChannel`` the light-source power is resolved via
+            ``resolve_power`` (so the device/property come from the
+            microscope's ``POWER_PROPERTIES`` rather than being hardcoded here).
+        resolve_power: callable(channel) -> (device, property, power) or None,
+            typically ``microscope.resolve_power``. If None (or it returns
+            None) the calibration events carry no power override and the line
+            stays at its current level.
         test_mode: try the function without a DMD set up in uManager. Defaults to False.
         """
         # Load all dmd properties from micro-manager
         self.mmc = mmc
         self.test_mode = test_mode
         self.affine = None
-        self.calibration_profile = calibration_profile
+        self.calibration_channel = calibration_channel
+        self._resolve_power = resolve_power
 
         if affine_matrix is not None:
             self.affine = affine_matrix
@@ -50,6 +62,32 @@ class DMD:
                 np.uint8
             )
             self.sample_mask_off = np.zeros((self.height, self.width)).astype(np.uint8)
+
+    def _calibration_channel_dict(self) -> dict:
+        """MDAEvent ``channel`` dict for the calibration channel."""
+        ch = self.calibration_channel
+        ch_dict = {"config": ch.config}
+        group = getattr(ch, "group", None)
+        if group:
+            ch_dict["group"] = group
+        return ch_dict
+
+    def _calibration_properties(self, power=None):
+        """MDAEvent ``properties`` for the calibration channel, or None.
+
+        Resolves (device, property, power) via the microscope's
+        ``resolve_power`` so the device/property come from the single
+        ``POWER_PROPERTIES`` source of truth. ``power`` overrides the channel's
+        power (e.g. ``0`` to blank the line after calibration).
+        """
+        if self._resolve_power is None:
+            return None
+        resolved = self._resolve_power(self.calibration_channel)
+        if resolved is None:
+            return None
+        device, prop, default_power = resolved
+        value = default_power if power is None else power
+        return [(device, prop, value)]
 
     def affine_transform(self, img):
         """Applies transformation matrix on image in camera space. Returns mask in dmd space.
@@ -215,17 +253,8 @@ class DMD:
             event_p = MDAEvent(
                 slm_image=SLMImage(data=img_p, device=self.name),
                 exposure=exposure,
-                channel={
-                    "config": self.calibration_profile["channel_config"],
-                    "group": self.calibration_profile["channel_group"],
-                },
-                properties=[
-                    (
-                        self.calibration_profile["device_name"],
-                        self.calibration_profile["property_name"],
-                        self.calibration_profile["power"],
-                    )
-                ],
+                channel=self._calibration_channel_dict(),
+                properties=self._calibration_properties(),
             )
             events.append(event_p)
 
@@ -291,13 +320,7 @@ class DMD:
                     MDAEvent(
                         slm_image=SLMImage(data=self.sample_mask_off, device=self.name),
                         exposure=1,
-                        properties=[
-                            (
-                                self.calibration_profile["device_name"],
-                                self.calibration_profile["property_name"],
-                                0,
-                            )
-                        ],
+                        properties=self._calibration_properties(0),
                     )
                 ]
             )
@@ -340,17 +363,8 @@ class DMD:
                 event_p = MDAEvent(
                     slm_image=SLMImage(data=img_warp, device=self.name),
                     exposure=exposure,
-                    channel={
-                        "config": self.calibration_profile["channel_config"],
-                        "group": self.calibration_profile["channel_group"],
-                    },
-                    properties=[
-                        (
-                            self.calibration_profile["device_name"],
-                            self.calibration_profile["property_name"],
-                            self.calibration_profile["power"],
-                        )
-                    ],
+                    channel=self._calibration_channel_dict(),
+                    properties=self._calibration_properties(),
                 )
                 events.append(event_p)
 
@@ -407,13 +421,7 @@ class DMD:
                 MDAEvent(
                     slm_image=SLMImage(data=self.sample_mask_off, device=self.name),
                     exposure=1,
-                    properties=[
-                        (
-                            self.calibration_profile["device_name"],
-                            self.calibration_profile["property_name"],
-                            0,
-                        )
-                    ],
+                    properties=self._calibration_properties(0),
                 )
             ]
         )

@@ -169,65 +169,6 @@ def validate_hardware(events, mmc, *, power_properties=None) -> bool:
     return len(problems) == 0
 
 
-def detect_power_properties(mmc, group=None) -> dict[str, tuple[str, str]]:
-    """Auto-detect per-channel power properties from the loaded Micro-Manager config.
-
-    Scans for devices with ``*_Level`` properties (e.g. Spectra, LedDMD) and
-    matches channel config presets to their corresponding power level property
-    by matching the LED color activated in each preset.
-
-    For example, with this config::
-
-        ConfigGroup,TTL_ERK,CyanStim,...,DA TTL LED,Label,Cyan
-        Property,Spectra,Cyan_Level,99
-
-    the function returns ``{"CyanStim": ("Spectra", "Cyan_Level")}``.
-
-    Parameters
-    ----------
-    mmc : CMMCorePlus
-        Initialized core instance with a config loaded.
-    group : str, optional
-        Channel group to inspect. If *None*, all config groups are scanned.
-
-    Returns
-    -------
-    dict[str, tuple[str, str]]
-        Mapping of config name to ``(device_name, property_name)``.
-    """
-    # 1. Find devices with *_Level properties (light sources like Spectra, LedDMD)
-    level_lookup: dict[str, tuple[str, str]] = {}  # color_lower → (device, prop)
-    for dev in mmc.getLoadedDevices():
-        for prop in mmc.getDevicePropertyNames(dev):
-            if prop.endswith("_Level"):
-                color = prop[:-6].lower()  # "Cyan_Level" → "cyan"
-                level_lookup[color] = (str(dev), prop)
-
-    if not level_lookup:
-        return {}
-
-    # 2. Determine which config groups to scan
-    groups = [group] if group else list(mmc.getAvailableConfigGroups())
-
-    # 3. For each channel config, check if any setting value matches a known LED color
-    result: dict[str, tuple[str, str]] = {}
-    for g in groups:
-        for config_name in mmc.getAvailableConfigs(g):
-            if config_name in result:
-                continue
-            config_data = mmc.getConfigData(g, config_name)
-            for i in range(config_data.size()):
-                value = config_data.getSetting(i).getPropertyValue().lower()
-                for color, dev_prop in level_lookup.items():
-                    if value == color or (len(color) >= 3 and value.startswith(color)):
-                        result[config_name] = dev_prop
-                        break
-                if config_name in result:
-                    break
-
-    return result
-
-
 def create_folders(path, folders):
     """Create all folders if they don't already exist.
 

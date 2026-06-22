@@ -251,8 +251,15 @@ class TestToMdaEventsOrder:
         c_indices = [m.index.get("c") for m in mda]
         assert c_indices == [0, 1, None]
 
-    def test_xy_only_on_first_imaging_channel(self):
-        """Only the first imaging MDAEvent carries x/y position."""
+    def test_xy_on_first_imaging_channel_and_stim(self):
+        """The first imaging channel AND the stim event carry x/y; extra
+        imaging channels omit it (stage already on target).
+
+        The stim event needs its own coordinates because in "previous" mode it
+        is dispatched before the imaging frames — without them the stage hasn't
+        moved to this FOV yet and the stim fires at the previous FOV's
+        position. (Regression: previous-mode stim was mistargeted by one FOV.)
+        """
         ev = RTMEvent(
             index={"t": 0, "p": 0},
             channels=(Channel(config="ch0", exposure=50), Channel(config="ch1", exposure=50)),
@@ -260,12 +267,14 @@ class TestToMdaEventsOrder:
             x_pos=42.0, y_pos=99.0, z_pos=0,
             min_start_time=0, metadata={"stim": True},
         )
-        mda = ev.to_mda_events()
-        assert mda[0].x_pos == 42.0
-        assert mda[0].y_pos == 99.0
-        for m in mda[1:]:
-            assert m.x_pos is None
-            assert m.y_pos is None
+        mda = ev.to_mda_events()  # current-mode emission order: ch0, ch1, stim
+        # first imaging channel carries xy
+        assert mda[0].x_pos == 42.0 and mda[0].y_pos == 99.0
+        # subsequent imaging channel omits xy (no redundant stage move)
+        assert mda[1].x_pos is None and mda[1].y_pos is None
+        # stim carries xy so previous-mode (stim-first) moves the stage first
+        stim_ev = next(m for m in mda if m.metadata["img_type"] == ImgType.IMG_STIM)
+        assert stim_ev.x_pos == 42.0 and stim_ev.y_pos == 99.0
 
     def test_img_type_from_metadata(self):
         """img_type is read from metadata, defaulting to IMG_RAW."""
@@ -306,6 +315,22 @@ class TestPlanEvents:
         planned = ev.plan_events(stim_mode="previous")
         types = [e.metadata["img_type"] for e in planned]
         assert types == [ImgType.IMG_STIM, ImgType.IMG_RAW]
+
+    def test_previous_mode_stim_carries_stage_position(self):
+        """In previous mode the stim is dispatched first, so it must carry the
+        FOV's stage coordinates — otherwise the stage hasn't moved to this FOV
+        and the stim fires at the previous FOV's position."""
+        ev = RTMEvent(
+            index={"t": 1, "p": 2},
+            channels=(Channel(config="ch0", exposure=50),),
+            stim_channels=(Channel(config="stim-405", exposure=100),),
+            x_pos=123.0, y_pos=456.0, z_pos=7.0, min_start_time=1,
+            metadata={"stim": True},
+        )
+        planned = ev.plan_events(stim_mode="previous")
+        first = planned[0]
+        assert first.metadata["img_type"] == ImgType.IMG_STIM
+        assert first.x_pos == 123.0 and first.y_pos == 456.0 and first.z_pos == 7.0
 
     def test_no_stim_channels_returns_imaging_only(self):
         """Without stim, both modes return the same imaging events."""

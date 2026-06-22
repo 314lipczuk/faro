@@ -558,6 +558,15 @@ class RTMEvent(MDAEvent):
                         index=dict(self.index),  # no "c" for stim
                         channel=ch_dict,
                         exposure=ch.exposure,
+                        # Carry the FOV's stage position. In "previous" mode the
+                        # stim is dispatched BEFORE the imaging frames, so without
+                        # this the stage hasn't moved to this FOV yet and the stim
+                        # fires at the previous FOV's position. The first imaging
+                        # event repeats these coords; the engine skips the
+                        # redundant move when already on target.
+                        x_pos=self.x_pos,
+                        y_pos=self.y_pos,
+                        z_pos=self.z_pos,
                         min_start_time=self.min_start_time,
                         metadata={**base_meta, "img_type": ImgType.IMG_STIM},
                         properties=props,

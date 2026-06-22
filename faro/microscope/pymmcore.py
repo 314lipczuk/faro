@@ -102,13 +102,31 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         return ""
 
     def resolve_power(self, channel):
-        """Return (device, property, power) for a PowerChannel, or None."""
+        """Return (device, property, power) for a PowerChannel, or None.
+
+        Returns None only when the channel carries no power (a plain Channel,
+        or a PowerChannel with ``power`` unset). When ``power`` IS set but no
+        device/property mapping can be resolved, this raises instead of
+        silently returning None — a silent None means the requested power is
+        never pushed to the hardware and the light source stays at whatever
+        value it happened to hold, which is a near-invisible failure.
+        """
         power = getattr(channel, "power", None)
         if power is None:
             return None
         mapping = self.get_power_properties().get(channel.config)
         if mapping is None:
-            return None
+            known = sorted(self.get_power_properties())
+            raise ValueError(
+                f"PowerChannel {channel.config!r} sets power={power}, but no "
+                f"power-property mapping resolves for it. It was not "
+                f"auto-detected from the config and is not listed in "
+                f"{type(self).__name__}.POWER_PROPERTIES. The requested power "
+                f"would be silently ignored. Add an explicit mapping, e.g.\n"
+                f"    POWER_PROPERTIES = {{..., {channel.config!r}: "
+                f"('<device>', '<Color>_Level')}}\n"
+                f"Currently mapped channels: {known or '(none)'}."
+            )
         device_name, property_name = mapping
         return (device_name, property_name, power)
 

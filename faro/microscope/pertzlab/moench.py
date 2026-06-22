@@ -101,8 +101,24 @@ class Moench(PyMMCoreMicroscope):
     USE_ONLY_PFS = True
     DMD_NEEDS_TO_BE_WAKEN = True
     DMD_CHANNEL_GROUP = "TTL_ERK"
+    # Manual config->(device, property) power mappings. These must be declared
+    # explicitly: this config selects LED lines via numeric NIDAQ TTL states
+    # (the preset stores e.g. State "16"; the color "GreenYellow" only lives in
+    # the port0 state labels), so there's no reliable way to infer them. A
+    # PowerChannel whose config is missing here raises in resolve_power()
+    # instead of silently dropping the requested power.
+    #
+    # Derived from TiMoench.cfg: each preset sets NIDAQDO-Dev1/port0 State, and
+    # the port's state labels give the color -> Spectra <Color>_Level:
+    #   State  4 Cyan        -> Cyan_Level
+    #   State 16 GreenYellow -> Green_Level
+    #   State 32 Red         -> Red_Level
+    #   State  8 Teal        -> Teal_Level
     POWER_PROPERTIES = {
-        "CyanStim": ("LED", "Cyan_Level"),
+        "CyanStim": ("LED", "Cyan_Level"),   # state 4  (pre-existing, known good)
+        "mScarlet3": ("LED", "Green_Level"),  # state 16, confirmed on scope 2026-06-22
+        "miRFP": ("LED", "Red_Level"),        # state 32, inferred from cfg labels
+        "mCitrine": ("LED", "Teal_Level"),    # state 8,  inferred from cfg labels
     }
     DMD_CALIBRATION_PROFILE = {
         "channel_group": "TTL_ERK",

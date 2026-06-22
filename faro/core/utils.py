@@ -128,6 +128,17 @@ def validate_hardware(events, mmc, *, power_properties=None) -> bool:
                 continue
             mapping = _pprops.get(ch.config)
             if mapping is None:
+                # A channel asks for a specific power but nothing maps its
+                # config to a device/property -> the power is silently dropped
+                # and the light source stays at its current value. Flag it so
+                # this surfaces before the run instead of as a flat exposure.
+                problems.append(
+                    f"Channel '{ch.config}' sets power={power} but has no "
+                    f"power-property mapping (not auto-detected, not in "
+                    f"POWER_PROPERTIES). The power will NOT be applied. Add it "
+                    f"to the microscope's POWER_PROPERTIES, e.g. "
+                    f"{{'{ch.config}': ('<device>', '<Color>_Level')}}."
+                )
                 continue
             device_name, property_name = mapping
             key = (device_name, property_name, power)

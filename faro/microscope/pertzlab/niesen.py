@@ -4,7 +4,6 @@ import requests
 from faro.microscope.pymmcore import PyMMCoreMicroscope
 import pymmcore_plus
 from faro.core.dmd import DMD
-from faro.core.data_structures import PowerChannel
 
 
 class WakeUpLaser:
@@ -47,12 +46,6 @@ class Niesen(PyMMCoreMicroscope):
     POWER_PROPERTIES = {
         "CyanStim": ("LedDMD", "Cyan_Level"),
     }
-    # DMD calibration light path. The (device, property) for the power come
-    # from POWER_PROPERTIES["CyanStim"] via resolve_power, so they aren't
-    # duplicated here.
-    DMD_CALIBRATION_CHANNEL = PowerChannel(
-        config="CyanStim", group="WF_DMD", power=100
-    )
 
     def __init__(self, affine_calibration_matrix=None, fast_init=False):
         super().__init__()
@@ -65,7 +58,6 @@ class Niesen(PyMMCoreMicroscope):
         self.init_scope()
         self.dmd = DMD(
             self.mmc,
-            self.DMD_CALIBRATION_CHANNEL,
             resolve_power=self.resolve_power,
             affine_matrix=affine_calibration_matrix,
         )
@@ -87,6 +79,7 @@ class Niesen(PyMMCoreMicroscope):
 
     def calibrate_dmd(
         self,
+        calibration_channel,
         verbose=False,
         n_points=15,
         radius=4,
@@ -97,6 +90,7 @@ class Niesen(PyMMCoreMicroscope):
         "Calibrate the DMD if it is not already calibrated." ""
         if self.dmd is not None and self.dmd.affine is None:
             self.dmd.calibrate(
+                calibration_channel,
                 verbose=verbose,
                 n_points=n_points,
                 radius=radius,

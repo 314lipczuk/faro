@@ -230,9 +230,10 @@ def microscope(scope_name: str, synthetic_affine: np.ndarray):
 
         mic = Jungfrau()
         _dmd_prof = SCOPE_DMD_PROFILES["jungfrau"]
+        # calibration_channel (_dmd_prof["channel"]) is passed at calibrate()
+        # time, not at construction.
         mic.dmd = DMD(
             mic.mmc,
-            _dmd_prof["channel"],
             resolve_power=_dmd_prof["resolve_power"],
             affine_matrix=synthetic_affine,
         )

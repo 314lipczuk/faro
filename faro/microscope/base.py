@@ -114,10 +114,10 @@ class AbstractMicroscope:
     # DMD
     # ------------------------------------------------------------------
 
-    def calibrate_dmd(self):
+    def calibrate_dmd(self, calibration_channel):
         "Calibrate the DMD if it is not already calibrated." ""
         if isinstance(self.dmd, DMD) and self.dmd.affine is None:
-            self.dmd.calibrate()
+            self.dmd.calibrate(calibration_channel)
 
     def post_experiment(self):
         """Post-process the experiment. Optional override."""

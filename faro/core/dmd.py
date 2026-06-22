@@ -23,30 +23,24 @@ class DMD:
     def __init__(
         self,
         mmc: CMMCorePlus,
-        calibration_channel,
         resolve_power=None,
         affine_matrix=None,
         test_mode: bool = False,
     ):
         """Args:
         mmc: core object from CMMCorePlus()
-        calibration_channel: a ``Channel``/``PowerChannel`` describing the
-            light path used to image the DMD spots during calibration. The
-            channel's ``config``/``group`` set the MDA channel; for a
-            ``PowerChannel`` the light-source power is resolved via
-            ``resolve_power`` (so the device/property come from the
-            microscope's ``POWER_PROPERTIES`` rather than being hardcoded here).
         resolve_power: callable(channel) -> (device, property, power) or None,
-            typically ``microscope.resolve_power``. If None (or it returns
-            None) the calibration events carry no power override and the line
-            stays at its current level.
+            typically ``microscope.resolve_power``. Used by :meth:`calibrate`
+            to resolve the calibration channel's light-source power from the
+            microscope's ``POWER_PROPERTIES`` (rather than hardcoding the
+            device/property). If None (or it returns None) calibration carries
+            no power override and the line stays at its current level.
         test_mode: try the function without a DMD set up in uManager. Defaults to False.
         """
         # Load all dmd properties from micro-manager
         self.mmc = mmc
         self.test_mode = test_mode
         self.affine = None
-        self.calibration_channel = calibration_channel
         self._resolve_power = resolve_power
 
         if affine_matrix is not None:
@@ -68,31 +62,41 @@ class DMD:
             # forced back to all-on.
             self.livemode_image = self.all_on_img()
 
-    def _calibration_channel_dict(self) -> dict:
-        """MDAEvent ``channel`` dict for the calibration channel."""
-        ch = self.calibration_channel
-        ch_dict = {"config": ch.config}
-        group = getattr(ch, "group", None)
+    def _calibration_channel_dict(self, channel) -> dict:
+        """MDAEvent ``channel`` dict for the calibration *channel*."""
+        ch_dict = {"config": channel.config}
+        group = getattr(channel, "group", None)
         if group:
             ch_dict["group"] = group
         return ch_dict
 
-    def _calibration_properties(self, power=None):
-        """MDAEvent ``properties`` for the calibration channel, or None.
+    def _calibration_properties(self, channel, power=None):
+        """MDAEvent ``properties`` for the calibration *channel*, or None.
 
         Resolves (device, property, power) via the microscope's
         ``resolve_power`` so the device/property come from the single
         ``POWER_PROPERTIES`` source of truth. ``power`` overrides the channel's
-        power (e.g. ``0`` to blank the line after calibration).
+        power (e.g. ``0`` to switch the line off after calibration).
         """
         if self._resolve_power is None:
             return None
-        resolved = self._resolve_power(self.calibration_channel)
+        resolved = self._resolve_power(channel)
         if resolved is None:
             return None
         device, prop, default_power = resolved
         value = default_power if power is None else power
         return [(device, prop, value)]
+
+    def _set_calibration_power(self, channel, power):
+        """Set the calibration line's power directly (no camera frame).
+
+        Used to switch the calibration light off when the routine finishes,
+        without running a throwaway blank capture.
+        """
+        props = self._calibration_properties(channel, power)
+        if props:
+            (device, prop, value), = props  # always exactly one: the LED power
+            self.mmc.setProperty(device, prop, value)
 
     def affine_transform(self, img):
         """Applies transformation matrix on image in camera space. Returns mask in dmd space.
@@ -225,6 +229,7 @@ class DMD:
 
     def calibrate(
         self,
+        calibration_channel,
         verbose=False,
         n_points=9,
         radius=4,
@@ -240,6 +245,11 @@ class DMD:
         Projects 3 points in DMD space and detects them in camera space,
         then finds the affine transofmation matrix.
         Args:
+            calibration_channel (Channel/PowerChannel): light path used to
+                image the DMD spots (config/group set the channel; for a
+                PowerChannel the power is resolved via the microscope's
+                resolve_power). Pass per experiment — e.g. a UV or a cyan
+                channel — so it isn't fixed on the microscope.
             verbose (bool, optional): Whether to display additional images during calibration. Defaults to False.
             blur (int, optional): Blur size for captured images. Defaults to 10.
             circle_size (int, optional): Size of the calibration circle projected. Defaults to 10.
@@ -276,8 +286,8 @@ class DMD:
             event_p = MDAEvent(
                 slm_image=SLMImage(data=img_p, device=self.name),
                 exposure=exposure,
-                channel=self._calibration_channel_dict(),
-                properties=self._calibration_properties(),
+                channel=self._calibration_channel_dict(calibration_channel),
+                properties=self._calibration_properties(calibration_channel),
             )
             events.append(event_p)
 
@@ -338,16 +348,7 @@ class DMD:
         )
 
         if np.sum(inliers) < 4:
-            self.mmc.mda.run(
-                [
-                    MDAEvent(
-                        slm_image=SLMImage(data=self.sample_mask_off, device=self.name),
-                        exposure=1,
-                        properties=self._calibration_properties(0),
-                    )
-                ]
-            )
-
+            self._set_calibration_power(calibration_channel, 0)
             print(
                 f"Not enough inliers found for calibration. Total inliers: {np.sum(inliers)}, required: 5. Try again. "
             )
@@ -386,8 +387,8 @@ class DMD:
                 event_p = MDAEvent(
                     slm_image=SLMImage(data=img_warp, device=self.name),
                     exposure=exposure,
-                    channel=self._calibration_channel_dict(),
-                    properties=self._calibration_properties(),
+                    channel=self._calibration_channel_dict(calibration_channel),
+                    properties=self._calibration_properties(calibration_channel),
                 )
                 events.append(event_p)
 
@@ -439,15 +440,7 @@ class DMD:
             axs[3].set_ylim(camera_height, 0)
 
             plt.show()
-        self.mmc.mda.run(
-            [
-                MDAEvent(
-                    slm_image=SLMImage(data=self.sample_mask_off, device=self.name),
-                    exposure=1,
-                    properties=self._calibration_properties(0),
-                )
-            ]
-        )
-        # Restore the live-view pattern (all-on) so the DMD doesn't sit blank
-        # after a successful calibration.
+        # Switch the calibration line off, then restore the live-view pattern
+        # (all-on) so the DMD doesn't sit blank after a successful calibration.
+        self._set_calibration_power(calibration_channel, 0)
         self.all_on()

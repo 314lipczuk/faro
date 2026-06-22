@@ -51,8 +51,9 @@ def _pump_qt_events() -> None:
 
 
 class KeepDMDAlive:
-    def __init__(self, mmc):
+    def __init__(self, mmc, dmd):
         self.mmc = mmc
+        self.dmd = dmd
         self.thread: threading.Thread | None = None
         self.last_wakeup = 0.0
         # daemon=True so interpreter shutdown doesn't block on this
@@ -60,9 +61,10 @@ class KeepDMDAlive:
         self._stop_event = threading.Event()
 
     def wakeup_dmd(self):
-        self.mmc.setSLMExposure(self.mmc.getSLMDevice(), 200000.0)
-        self.mmc.setSLMPixelsTo(self.mmc.getSLMDevice(), 255)
-        self.mmc.displaySLMImage(self.mmc.getSLMDevice())
+        # Re-display the DMD's current live-view pattern (all-on by default,
+        # or e.g. a checkerboard set for a focus check) so it survives the
+        # periodic refresh instead of being forced back to all-on.
+        self.dmd.display_livemode()
 
     def run(self):
         _set_c_numeric_locale()
@@ -176,7 +178,7 @@ class Moench(PyMMCoreMicroscope):
             resolve_power=self.resolve_power,
             affine_matrix=self.affine_calibration_matrix,
         )
-        self.wakeup_dmd = KeepDMDAlive(self.mmc)
+        self.wakeup_dmd = KeepDMDAlive(self.mmc, self.dmd)
         self.wakeup_dmd.run()
 
         self.image_height = self.mmc.getImageHeight()

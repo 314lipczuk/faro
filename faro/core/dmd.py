@@ -62,6 +62,11 @@ class DMD:
                 np.uint8
             )
             self.sample_mask_off = np.zeros((self.height, self.width)).astype(np.uint8)
+            # The pattern shown during live view. The microscope's keep-alive
+            # loop re-displays this every refresh, so whatever all_on() /
+            # checker_board() / all_off() last set persists instead of being
+            # forced back to all-on.
+            self.livemode_image = self.all_on_img()
 
     def _calibration_channel_dict(self) -> dict:
         """MDAEvent ``channel`` dict for the calibration channel."""
@@ -116,15 +121,30 @@ class DMD:
             img_transformed = img_transformed * 255
         return img_transformed
 
-    def all_on(self):
-        """turn on projector all pixels for a long time"""
-        self.mmc.setSLMPixelsTo(self.name, 255)
+    def display_livemode(self):
+        """Display the current live-view pattern with a long SLM exposure.
+
+        Used by all_on / all_off / checker_board and by the microscope's
+        keep-alive loop, which calls this on every refresh so the pattern
+        chosen for live view stays put (rather than reverting to all-on).
+        """
+        self.mmc.setSLMExposure(self.name, 200000.0)
+        self.mmc.setSLMImage(self.name, self.livemode_image)
         self.mmc.displaySLMImage(self.name)
 
+    def all_on(self):
+        """Set the live-view DMD pattern to all-pixels-on (persists).
+
+        Use to return the DMD to full-open after a focus-check pattern such
+        as checker_board().
+        """
+        self.livemode_image = self.all_on_img()
+        self.display_livemode()
+
     def all_off(self):
-        """turn off pixels"""
-        self.mmc.setSLMPixelsTo(self.name, 0)
-        self.mmc.displaySLMImage(self.name)
+        """Set the live-view DMD pattern to all-pixels-off (persists)."""
+        self.livemode_image = np.zeros((self.height, self.width), dtype=np.uint8)
+        self.display_livemode()
 
     def all_on_img(self):
         """generate an image with all pixels on"""
@@ -132,14 +152,17 @@ class DMD:
         return all_on_image
 
     def checker_board(self, pixels=20):
-        """display a checkerboard pattern for a long time"""
-        # build checkerboard
+        """Set the live-view DMD pattern to a checkerboard (persists).
+
+        Handy for checking DMD focus during live view: the keep-alive loop
+        re-displays this pattern instead of reverting to all-on after a few
+        seconds.
+        """
         checker_board = (np.indices((self.height, self.width)) // pixels).sum(
             axis=0
         ) % 2
-        checker_board = checker_board.astype(np.uint8) * 255
-        self.mmc.setSLMImage(self.name, checker_board)
-        self.mmc.displaySLMImage(self.name)
+        self.livemode_image = checker_board.astype(np.uint8) * 255
+        self.display_livemode()
 
     def select_well_distributed_points(self, valid_pixels, n_points):
         """
@@ -425,3 +448,6 @@ class DMD:
                 )
             ]
         )
+        # Restore the live-view pattern (all-on) so the DMD doesn't sit blank
+        # after a successful calibration.
+        self.all_on()

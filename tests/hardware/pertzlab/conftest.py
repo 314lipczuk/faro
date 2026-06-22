@@ -31,7 +31,7 @@ import pandas as pd
 import pytest
 import zarr
 
-from faro.core.data_structures import SegmentationMethod
+from faro.core.data_structures import PowerChannel, SegmentationMethod
 from faro.stimulation.base import StimWithImage
 from tests.conftest import resolve_scope
 
@@ -86,17 +86,17 @@ SCOPE_CHANNELS = {
 }
 
 
-# Per-scope DMD calibration profile used to instantiate ``DMD`` where
+# Per-scope DMD calibration channel used to instantiate ``DMD`` where
 # the microscope class doesn't already do so in its constructor (only
 # Jungfrau today — its DMD isn't yet wired into the cfg, so this will
 # raise loudly when the SLM device is missing, surfacing the gap).
+# Each entry is (calibration_channel, resolve_power). Jungfrau has no
+# POWER_PROPERTIES yet, so the mapping is supplied inline for the test
+# rather than via mic.resolve_power.
 SCOPE_DMD_PROFILES: dict[str, dict] = {
     "jungfrau": {
-        "channel_group": "TTL_ERK",
-        "channel_config": "CyanStim",
-        "device_name": "LED",
-        "property_name": "Cyan_Level",
-        "power": 5,
+        "channel": PowerChannel(config="CyanStim", group="TTL_ERK", power=5),
+        "resolve_power": lambda ch: ("LED", "Cyan_Level", ch.power),
     },
 }
 
@@ -229,9 +229,12 @@ def microscope(scope_name: str, synthetic_affine: np.ndarray):
         from faro.microscope.pertzlab.jungfrau import Jungfrau
 
         mic = Jungfrau()
+        _dmd_prof = SCOPE_DMD_PROFILES["jungfrau"]
+        # calibration_channel (_dmd_prof["channel"]) is passed at calibrate()
+        # time, not at construction.
         mic.dmd = DMD(
             mic.mmc,
-            SCOPE_DMD_PROFILES["jungfrau"],
+            resolve_power=_dmd_prof["resolve_power"],
             affine_matrix=synthetic_affine,
         )
         mic.dmd_needs_to_be_waken = False

@@ -8,7 +8,7 @@ import enum
 from typing import Any, Generic, Iterable, Iterator, Literal, Optional, TypeVar, Union
 import numpy as np
 import pandas as pd
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from faro.segmentation.base import Segmentator
 from dataclasses import dataclass, InitVar
 
@@ -283,7 +283,12 @@ class FovState:
 class SegmentationMethod:
     name: str
     segmentation_class: Segmentator
-    use_channel: int = 0
+    # Channel(s) of the (C, Y, X) frame to segment. An int selects a single
+    # channel and yields a 2D (Y, X) image; a list selects several and yields
+    # a (len, Y, X) stack (e.g. ``[0, 1]`` for membrane + nuclear). Only
+    # ``CellposeV4`` currently accepts a multi-channel stack; the other
+    # segmentators expect a single 2D channel.
+    use_channel: int | list[int] = 0
     save_tracked: bool = False
 
 
@@ -553,6 +558,15 @@ class RTMEvent(MDAEvent):
                         index=dict(self.index),  # no "c" for stim
                         channel=ch_dict,
                         exposure=ch.exposure,
+                        # Carry the FOV's stage position. In "previous" mode the
+                        # stim is dispatched BEFORE the imaging frames, so without
+                        # this the stage hasn't moved to this FOV yet and the stim
+                        # fires at the previous FOV's position. The first imaging
+                        # event repeats these coords; the engine skips the
+                        # redundant move when already on target.
+                        x_pos=self.x_pos,
+                        y_pos=self.y_pos,
+                        z_pos=self.z_pos,
                         min_start_time=self.min_start_time,
                         metadata={**base_meta, "img_type": ImgType.IMG_STIM},
                         properties=props,
@@ -622,6 +636,21 @@ def _resolve_frame_set(frames, n_timepoints: int) -> set[int]:
 # ---------------------------------------------------------------------------
 
 
+def _channel_with_exposure(ch: Channel, exposure) -> Channel:
+    """Clone *ch* with a new exposure, preserving its type/group/power.
+
+    Used when rebuilding channels with a per-frame exposure so a
+    ``PowerChannel`` doesn't get silently downgraded to a plain ``Channel``
+    (which would drop ``power`` and the light path would stay at its current
+    level).
+    """
+    if isinstance(ch, PowerChannel):
+        return PowerChannel(
+            config=ch.config, exposure=exposure, group=ch.group, power=ch.power
+        )
+    return Channel(config=ch.config, exposure=exposure, group=ch.group)
+
+
 class RTMSequence(MDASequence):
     """MDASequence with stimulation, reference acquisition, and pipeline metadata.
 
@@ -643,6 +672,39 @@ class RTMSequence(MDASequence):
     rtm_metadata: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {**MDASequence.model_config, "arbitrary_types_allowed": True}
+
+    # config -> original faro imaging Channel/PowerChannel. useq's Channel has
+    # no ``power`` field, so once imaging channels enter the useq layer the
+    # PowerChannel info (power, and the faro group) is dropped. We stash the
+    # originals here at construction so iter_events can rebuild the imaging
+    # channels with power/group intact.
+    _orig_channels: dict[str, Channel] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _retain_faro_channels(cls, data: Any, handler) -> "RTMSequence":
+        """Capture the original faro imaging channels before useq strips them.
+
+        ``mode="wrap"`` runs before field validators, so ``data["channels"]``
+        is still the faro Channel/PowerChannel objects (or dicts) the caller
+        passed — useq's lossy coercion hasn't happened yet.
+        """
+        originals: dict[str, Channel] = {}
+        if isinstance(data, dict):
+            for v in data.get("channels", ()) or ():
+                if isinstance(v, Channel):
+                    originals[v.config] = v
+                elif isinstance(v, dict) and v.get("power") is not None:
+                    originals[v["config"]] = PowerChannel(
+                        config=v["config"],
+                        exposure=v.get("exposure"),
+                        group=v.get("group"),
+                        power=v["power"],
+                    )
+        obj = handler(data)
+        if originals:
+            object.__setattr__(obj, "_orig_channels", originals)
+        return obj
 
     @field_validator("channels", mode="before")
     @classmethod
@@ -710,9 +772,20 @@ class RTMSequence(MDASequence):
                 }
             if mda_ev.channel:
                 ch_name = mda_ev.channel.config
-                groups[key]["channels"].append(
-                    Channel(config=ch_name, exposure=mda_ev.exposure or 0)
-                )
+                exposure = mda_ev.exposure or 0
+                orig = self._orig_channels.get(ch_name)
+                if orig is not None:
+                    # Rebuild from the original faro channel so power/group
+                    # survive (useq dropped them); keep the event's exposure.
+                    ch = _channel_with_exposure(orig, exposure)
+                else:
+                    # Fallback: at least recover the group from the useq channel.
+                    ch = Channel(
+                        config=ch_name,
+                        exposure=exposure,
+                        group=getattr(mda_ev.channel, "group", None),
+                    )
+                groups[key]["channels"].append(ch)
 
         merged_meta = {**self.metadata, **self.rtm_metadata}
         stim_tuple = tuple(self.stim_channels)
@@ -739,18 +812,13 @@ class RTMSequence(MDASequence):
                     stim = stim_tuple
                 elif isinstance(self.stim_exposure, (int, float)):
                     stim = tuple(
-                        Channel(
-                            config=ch.config,
-                            exposure=self.stim_exposure,
-                            group=ch.group,
-                        )
+                        _channel_with_exposure(ch, self.stim_exposure)
                         for ch in stim_tuple
                     )
                 else:
                     exp = stim_exposure_map[t]
                     stim = tuple(
-                        Channel(config=ch.config, exposure=exp, group=ch.group)
-                        for ch in stim_tuple
+                        _channel_with_exposure(ch, exp) for ch in stim_tuple
                     )
             else:
                 stim = ()

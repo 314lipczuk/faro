@@ -51,8 +51,9 @@ def _pump_qt_events() -> None:
 
 
 class KeepDMDAlive:
-    def __init__(self, mmc):
+    def __init__(self, mmc, dmd):
         self.mmc = mmc
+        self.dmd = dmd
         self.thread: threading.Thread | None = None
         self.last_wakeup = 0.0
         # daemon=True so interpreter shutdown doesn't block on this
@@ -60,9 +61,10 @@ class KeepDMDAlive:
         self._stop_event = threading.Event()
 
     def wakeup_dmd(self):
-        self.mmc.setSLMExposure(self.mmc.getSLMDevice(), 200000.0)
-        self.mmc.setSLMPixelsTo(self.mmc.getSLMDevice(), 255)
-        self.mmc.displaySLMImage(self.mmc.getSLMDevice())
+        # Re-display the DMD's current live-view pattern (all-on by default,
+        # or e.g. a checkerboard set for a focus check) so it survives the
+        # periodic refresh instead of being forced back to all-on.
+        self.dmd.display_livemode()
 
     def run(self):
         _set_c_numeric_locale()
@@ -101,15 +103,24 @@ class Moench(PyMMCoreMicroscope):
     USE_ONLY_PFS = True
     DMD_NEEDS_TO_BE_WAKEN = True
     DMD_CHANNEL_GROUP = "TTL_ERK"
+    # Manual config->(device, property) power mappings. These must be declared
+    # explicitly: this config selects LED lines via numeric NIDAQ TTL states
+    # (the preset stores e.g. State "16"; the color "GreenYellow" only lives in
+    # the port0 state labels), so there's no reliable way to infer them. A
+    # PowerChannel whose config is missing here raises in resolve_power()
+    # instead of silently dropping the requested power.
+    #
+    # Derived from TiMoench.cfg: each preset sets NIDAQDO-Dev1/port0 State, and
+    # the port's state labels give the color -> Spectra <Color>_Level:
+    #   State  4 Cyan        -> Cyan_Level
+    #   State 16 GreenYellow -> Green_Level
+    #   State 32 Red         -> Red_Level
+    #   State  8 Teal        -> Teal_Level
     POWER_PROPERTIES = {
-        "CyanStim": ("LED", "Cyan_Level"),
-    }
-    DMD_CALIBRATION_PROFILE = {
-        "channel_group": "TTL_ERK",
-        "channel_config": "CyanStim",
-        "device_name": "LED",
-        "property_name": "Cyan_Level",
-        "power": 10,
+        "CyanStim": ("LED", "Cyan_Level"),   # state 4  (pre-existing, known good)
+        "mScarlet3": ("LED", "Green_Level"),  # state 16, confirmed on scope 2026-06-22
+        "miRFP": ("LED", "Red_Level"),        # state 32, inferred from cfg labels
+        "mCitrine": ("LED", "Teal_Level"),    # state 8,  inferred from cfg labels
     }
     BINNING = "2x2"
     # ROI applied as-is after binning — no centering recomputation.
@@ -157,10 +168,10 @@ class Moench(PyMMCoreMicroscope):
         self.slm_height = self.mmc.getSLMHeight(self.slm_dev)
         self.dmd = DMD(
             self.mmc,
-            self.DMD_CALIBRATION_PROFILE,
+            resolve_power=self.resolve_power,
             affine_matrix=self.affine_calibration_matrix,
         )
-        self.wakeup_dmd = KeepDMDAlive(self.mmc)
+        self.wakeup_dmd = KeepDMDAlive(self.mmc, self.dmd)
         self.wakeup_dmd.run()
 
         self.image_height = self.mmc.getImageHeight()
@@ -168,6 +179,7 @@ class Moench(PyMMCoreMicroscope):
 
     def calibrate_dmd(
         self,
+        calibration_channel,
         verbose=False,
         n_points=15,
         radius=4,
@@ -176,9 +188,12 @@ class Moench(PyMMCoreMicroscope):
         calibration_points_DMD=None,
         background=True,
     ):
-        """Calibrate the DMD against the camera (if not already calibrated).
+        """Calibrate the DMD against the camera. Always runs when called
+        (re-call to retune, e.g. with a different channel or power).
 
         Args:
+            calibration_channel: the light path (Channel/PowerChannel) to image
+                the DMD spots with — pass per experiment (e.g. UV vs cyan).
             background: When True (default), the calibration MDAs run on a
                 worker thread while this call pumps the Qt event loop, so
                 napari stays responsive and previews the calibration spots
@@ -194,13 +209,14 @@ class Moench(PyMMCoreMicroscope):
         """
         self.disable_log_output()
 
-        if self.dmd is None or self.dmd.affine is not None:
+        if self.dmd is None:
             return
 
         def _do_calibration() -> None:
             self.wakeup_dmd.stop()
             try:
                 self.dmd.calibrate(
+                    calibration_channel,
                     verbose=verbose,
                     n_points=n_points,
                     radius=radius,

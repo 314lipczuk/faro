@@ -1,9 +1,9 @@
 """Pure-Python unit tests for Pertzlab-specific faro code.
 
 Lives under ``tests/hardware/pertzlab/`` because its subjects are
-Pertzlab-scope-only: :func:`faro.core.utils.detect_power_properties`
-exercised with the Spectra / LedDMD / DA TTL LED configuration shapes
-we actually use, and
+Pertzlab-scope-only: per-microscope power-property mappings (declared
+manually; an unmapped ``PowerChannel`` fails loud rather than silently
+dropping the requested power) and
 :class:`faro.microscope.pertzlab.moench.MoenchMDAEngine`'s
 ``SKIP_WAIT_DEVICES`` filter.
 
@@ -13,121 +13,73 @@ These do **not** require a real scope and are **not** marked
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from faro.core.utils import detect_power_properties
-from tests.fake_mmc import build_validation_core as _core
+from faro.core.data_structures import Channel, PowerChannel
 
 
 # ===================================================================
-# Auto-detection of power properties
+# Power-property mapping (manual-only; unmapped power fails loud)
 # ===================================================================
 
-class TestDetectPowerProperties:
-    """detect_power_properties infers channel→power mappings from config."""
+class TestPowerPropertyMapping:
+    """Power mappings are declared on the microscope; no auto-detection."""
 
-    def test_detects_spectra_cyan(self):
-        """CyanStim config activating Cyan LED → (Spectra, Cyan_Level)."""
-        mmc = _core(
-            config_groups={"TTL_ERK": ["CyanStim", "miRFP", "BF"]},
-            devices={"Spectra": ["Cyan_Level", "Red_Level", "Green_Level"]},
-            config_data={
-                ("TTL_ERK", "CyanStim"): [
-                    ("DA TTL LED", "Label", "Cyan"),
-                    ("Wheel-C", "Label", "480/40"),
-                ],
-                ("TTL_ERK", "miRFP"): [
-                    ("DA TTL LED", "Label", "Red"),
-                    ("Wheel-C", "Label", "640/30"),
-                ],
-                ("TTL_ERK", "BF"): [
-                    ("DA TTL LED", "Label", "OFF"),
-                    ("DA TTL Bright", "Label", "On"),
-                ],
-            },
-        )
-
-        result = detect_power_properties(mmc)
-        assert result["CyanStim"] == ("Spectra", "Cyan_Level")
-        assert result["miRFP"] == ("Spectra", "Red_Level")
-        assert "BF" not in result  # OFF doesn't match any color
-
-    def test_greenyellow_matches_green_level(self):
-        """GreenYellow LED label matches Green_Level via prefix."""
-        mmc = _core(
-            config_groups={"Channel": ["mScarlet3"]},
-            devices={"Spectra": ["Green_Level"]},
-            config_data={
-                ("Channel", "mScarlet3"): [
-                    ("DA TTL LED", "Label", "GreenYellow"),
-                ],
-            },
-        )
-        result = detect_power_properties(mmc)
-        assert result["mScarlet3"] == ("Spectra", "Green_Level")
-
-    def test_scans_specific_group(self):
-        """When group is specified, only that group is scanned."""
-        mmc = _core(
-            config_groups={
-                "TTL_ERK": ["CyanStim"],
-                "Other": ["SomeConfig"],
-            },
-            devices={"Spectra": ["Cyan_Level"]},
-            config_data={
-                ("TTL_ERK", "CyanStim"): [("DA TTL LED", "Label", "Cyan")],
-                ("Other", "SomeConfig"): [("DA TTL LED", "Label", "Cyan")],
-            },
-        )
-        result = detect_power_properties(mmc, group="TTL_ERK")
-        assert "CyanStim" in result
-        assert "SomeConfig" not in result
-
-    def test_no_level_devices_returns_empty(self):
-        """No devices with *_Level properties → empty result."""
-        mmc = _core(
-            config_groups={"Channel": ["GFP"]},
-            devices={"Camera": ["Exposure", "Binning"]},
-            config_data={("Channel", "GFP"): [("Filter", "Label", "GFP")]},
-        )
-        assert detect_power_properties(mmc) == {}
-
-    def test_works_with_leddmd_device(self):
-        """Works with LedDMD (Niesen) instead of Spectra."""
-        mmc = _core(
-            config_groups={"WF_DMD": ["CyanStim"]},
-            devices={"LedDMD": ["Cyan_Level", "Red_Level"]},
-            config_data={
-                ("WF_DMD", "CyanStim"): [("DA TTL LED", "Label", "Cyan")],
-            },
-        )
-        result = detect_power_properties(mmc)
-        assert result["CyanStim"] == ("LedDMD", "Cyan_Level")
-
-    def test_microscope_auto_detect_merges_with_manual(self):
-        """PyMMCoreMicroscope.get_power_properties merges detected + manual."""
+    def _mic(self, mapping):
         from faro.microscope.pymmcore import PyMMCoreMicroscope
 
-        mmc = _core(
-            config_groups={"TTL_ERK": ["CyanStim", "miRFP"]},
-            devices={"Spectra": ["Cyan_Level", "Red_Level"]},
-            config_data={
-                ("TTL_ERK", "CyanStim"): [("DA TTL LED", "Label", "Cyan")],
-                ("TTL_ERK", "miRFP"): [("DA TTL LED", "Label", "Red")],
-            },
-        )
-
         mic = PyMMCoreMicroscope()
-        mic.mmc = mmc
-        # Manual override for CyanStim (should take priority)
-        mic.POWER_PROPERTIES = {"CyanStim": ("CustomDev", "CustomProp")}
-        mic.detect_power_properties()
+        mic.POWER_PROPERTIES = mapping
+        return mic
 
-        merged = mic.get_power_properties()
-        # Manual override wins
-        assert merged["CyanStim"] == ("CustomDev", "CustomProp")
-        # Auto-detected still present
-        assert merged["miRFP"] == ("Spectra", "Red_Level")
+    def test_get_power_properties_is_manual_only(self):
+        mic = self._mic({"CyanStim": ("LED", "Cyan_Level")})
+        assert mic.get_power_properties() == {"CyanStim": ("LED", "Cyan_Level")}
+
+    def test_resolve_power_mapped(self):
+        mic = self._mic({"CyanStim": ("LED", "Cyan_Level")})
+        ch = PowerChannel(config="CyanStim", exposure=10, power=25)
+        assert mic.resolve_power(ch) == ("LED", "Cyan_Level", 25)
+
+    def test_resolve_power_none_without_power(self):
+        """Plain Channels and power-less PowerChannels resolve to None."""
+        mic = self._mic({"CyanStim": ("LED", "Cyan_Level")})
+        assert mic.resolve_power(Channel(config="BF", exposure=10)) is None
+        assert mic.resolve_power(PowerChannel(config="x", exposure=10)) is None
+
+    def test_resolve_power_raises_when_unmapped(self):
+        """A PowerChannel with power set but no mapping must fail loud."""
+        mic = self._mic({"CyanStim": ("LED", "Cyan_Level")})
+        ch = PowerChannel(config="mScarlet3", exposure=10, power=10)
+        with pytest.raises(ValueError, match="mScarlet3"):
+            mic.resolve_power(ch)
+
+    def test_validate_hardware_flags_unmapped_power(self):
+        """validate_hardware warns + fails when a power channel has no mapping."""
+        from faro.core.utils import validate_hardware
+
+        class _StubMMC:
+            def getAvailableConfigGroups(self):
+                return ["TTL_ERK"]
+
+            def getAvailableConfigs(self, group):
+                return ["mScarlet3"]
+
+            def getCameraDevice(self):
+                return ""  # skip the exposure-limit block
+
+        events = [
+            SimpleNamespace(
+                channels=[PowerChannel(config="mScarlet3", exposure=200, power=10)],
+                stim_channels=[],
+                ref_channels=[],
+            )
+        ]
+        with pytest.warns(UserWarning, match="no power-property mapping"):
+            ok = validate_hardware(events, _StubMMC(), power_properties={})
+        assert ok is False
 
 
 # ===================================================================

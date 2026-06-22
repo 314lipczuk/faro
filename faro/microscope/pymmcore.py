@@ -14,9 +14,9 @@ class PyMMCoreMicroscope(AbstractMicroscope):
     to ``self.mmc`` (run_mda, frameReady signal, cancel, etc.).
 
     Power properties (mapping channel config -> light-source device/property)
-    are auto-detected from the loaded Micro-Manager config.  Subclasses may
-    set ``POWER_PROPERTIES`` to override or supplement the auto-detected
-    values.
+    are declared explicitly per microscope via ``POWER_PROPERTIES``. A
+    ``PowerChannel`` whose config is not mapped raises in
+    :meth:`resolve_power` rather than silently dropping the requested power.
 
     On construction, an atexit hook is registered that cancels any running
     MDA and unloads every Micro-Manager device when the interpreter shuts
@@ -33,7 +33,6 @@ class PyMMCoreMicroscope(AbstractMicroscope):
     def __init__(self):
         super().__init__()
         self.mmc = None  # subclasses must set this
-        self._detected_power_properties: dict[str, tuple[str, str]] | None = None
         self._current_group: str | None = None
 
         # Register cleanup via a weakref so the hook doesn't pin the
@@ -102,13 +101,31 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         return ""
 
     def resolve_power(self, channel):
-        """Return (device, property, power) for a PowerChannel, or None."""
+        """Return (device, property, power) for a PowerChannel, or None.
+
+        Returns None only when the channel carries no power (a plain Channel,
+        or a PowerChannel with ``power`` unset). When ``power`` IS set but no
+        device/property mapping can be resolved, this raises instead of
+        silently returning None — a silent None means the requested power is
+        never pushed to the hardware and the light source stays at whatever
+        value it happened to hold, which is a near-invisible failure.
+        """
         power = getattr(channel, "power", None)
         if power is None:
             return None
         mapping = self.get_power_properties().get(channel.config)
         if mapping is None:
-            return None
+            known = sorted(self.get_power_properties())
+            raise ValueError(
+                f"PowerChannel {channel.config!r} sets power={power}, but no "
+                f"power-property mapping resolves for it. It was not "
+                f"auto-detected from the config and is not listed in "
+                f"{type(self).__name__}.POWER_PROPERTIES. The requested power "
+                f"would be silently ignored. Add an explicit mapping, e.g.\n"
+                f"    POWER_PROPERTIES = {{..., {channel.config!r}: "
+                f"('<device>', '<Color>_Level')}}\n"
+                f"Currently mapped channels: {known or '(none)'}."
+            )
         device_name, property_name = mapping
         return (device_name, property_name, power)
 
@@ -116,28 +133,16 @@ class PyMMCoreMicroscope(AbstractMicroscope):
     # Power property management
     # ------------------------------------------------------------------
 
-    def detect_power_properties(self, group=None) -> dict[str, tuple[str, str]]:
-        """Auto-detect power properties from the loaded Micro-Manager config.
-
-        Scans for devices with ``*_Level`` properties (e.g. Spectra, LedDMD)
-        and matches channel config presets to their LED color.
-
-        Call this after ``mmc.loadSystemConfiguration()`` to populate the
-        mapping.  Results are cached; call with ``group`` to restrict the scan.
-        Manual ``POWER_PROPERTIES`` always take priority over auto-detected ones.
-        """
-        if self.mmc is None:
-            return {}
-        from faro.core.utils import detect_power_properties
-        detected = detect_power_properties(self.mmc, group=group)
-        self._detected_power_properties = detected
-        return detected
-
     def get_power_properties(self) -> dict[str, tuple[str, str]]:
-        """Return merged power properties (auto-detected + manual overrides)."""
-        detected = self._detected_power_properties or {}
-        # Manual POWER_PROPERTIES override auto-detected ones
-        return {**detected, **self.POWER_PROPERTIES}
+        """Return the microscope's declared config -> (device, property) map.
+
+        Mappings are declared explicitly on the subclass via
+        ``POWER_PROPERTIES``. There is no auto-detection: the LED-selection
+        wiring differs per config (color-named presets vs numeric TTL states),
+        so inferring it silently caused requested powers to be dropped without
+        warning.
+        """
+        return dict(self.POWER_PROPERTIES)
 
     # ------------------------------------------------------------------
     # Internal: signal-backend safety net
@@ -191,9 +196,6 @@ class PyMMCoreMicroscope(AbstractMicroscope):
         ok = super().validate_hardware(events)
         if self.mmc is None:
             return ok  # nothing else to validate against
-        # Auto-detect on first use if not yet done
-        if self._detected_power_properties is None:
-            self.detect_power_properties()
         from faro.core.utils import validate_hardware
         ok_mmc = validate_hardware(
             events, self.mmc, power_properties=self.get_power_properties()

@@ -150,7 +150,7 @@ class _PropertyHolder(GenericDevice):
     """Stub device that registers arbitrary named properties.
 
     Used for light sources (``Spectra``, ``LedDMD`` etc.) that
-    ``validate_hardware`` / ``detect_power_properties`` need to see.
+    ``validate_hardware`` needs to see.
     Each property is a bare string slot or a float slot with ``(lo, hi)``
     limits.
     """
@@ -189,7 +189,7 @@ def build_core(
     Acquisition tests pass a ``Scene`` and nothing else. Validation tests
     (``validate_hardware``) pass the kwargs to register property limits,
     extra light-source devices, and per-config property settings so
-    ``detect_power_properties`` and range checks find what they expect.
+    range checks find what they expect.
 
     ``channel_group=""`` leaves the core's channel group unset (some
     validation tests rely on ``getChannelGroup() == ""`` triggering a

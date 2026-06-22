@@ -46,13 +46,6 @@ class Niesen(PyMMCoreMicroscope):
     POWER_PROPERTIES = {
         "CyanStim": ("LedDMD", "Cyan_Level"),
     }
-    DMD_CALIBRATION_PROFILE = {
-        "channel_group": "WF_DMD",
-        "channel_config": "CyanStim",
-        "device_name": "LedDMD",
-        "property_name": "Cyan_Level",
-        "power": 100,
-    }
 
     def __init__(self, affine_calibration_matrix=None, fast_init=False):
         super().__init__()
@@ -65,7 +58,7 @@ class Niesen(PyMMCoreMicroscope):
         self.init_scope()
         self.dmd = DMD(
             self.mmc,
-            self.DMD_CALIBRATION_PROFILE,
+            resolve_power=self.resolve_power,
             affine_matrix=affine_calibration_matrix,
         )
         self.slm_dev = None
@@ -86,6 +79,7 @@ class Niesen(PyMMCoreMicroscope):
 
     def calibrate_dmd(
         self,
+        calibration_channel,
         verbose=False,
         n_points=15,
         radius=4,
@@ -93,9 +87,10 @@ class Niesen(PyMMCoreMicroscope):
         marker_style="x",
         calibration_points_DMD=None,
     ):
-        "Calibrate the DMD if it is not already calibrated." ""
-        if self.dmd is not None and self.dmd.affine is None:
+        """Calibrate the DMD. Always runs the calibration when called."""
+        if self.dmd is not None:
             self.dmd.calibrate(
+                calibration_channel,
                 verbose=verbose,
                 n_points=n_points,
                 radius=radius,

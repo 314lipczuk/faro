@@ -16,6 +16,7 @@ import pytest
 from faro.core.data_structures import (
     Channel,
     ImgType,
+    PowerChannel,
     RTMEvent,
     RTMSequence,
     combine,
@@ -413,6 +414,51 @@ class TestRefPhase:
         # Last 1: ref
         assert events[3].channels[0].config == "mCitrine"
         assert events[3].metadata["img_type"] == ImgType.IMG_REF
+
+
+# ===================================================================
+# PowerChannel survives iter_events (regression)
+# ===================================================================
+
+class TestPowerChannelPreserved:
+    """Imaging PowerChannels keep power+group through RTMSequence.iter_events.
+
+    Regression: imaging channels enter the useq layer, whose Channel has no
+    ``power`` field, so iter_events used to rebuild them as bare
+    Channel(config, exposure) -- dropping power and group. resolve_power then
+    saw power=None and the LED stayed at its current level.
+    """
+
+    def _seq(self, stim_exposure=None):
+        return RTMSequence(
+            time_plan={"interval": 1.0, "loops": 2},
+            stage_positions=[(0, 0, 0), (100, 100, 0)],
+            channels=[
+                PowerChannel(config="mScarlet3", exposure=250, group="TTL_ERK", power=20),
+                PowerChannel(config="miRFP", exposure=350, group="TTL_ERK", power=100),
+            ],
+            stim_channels=(PowerChannel(config="CyanStim", exposure=200, group="TTL_ERK", power=25),),
+            stim_frames={1},
+            stim_exposure=stim_exposure,
+            ref_channels=(PowerChannel(config="mCitrine", exposure=500, group="TTL_ERK", power=100),),
+            ref_frames={1},
+        )
+
+    def test_imaging_channels_keep_power_and_group(self):
+        ev = next(iter(self._seq()))
+        assert [type(c).__name__ for c in ev.channels] == ["PowerChannel", "PowerChannel"]
+        assert (ev.channels[0].config, ev.channels[0].power, ev.channels[0].group) == (
+            "mScarlet3", 20, "TTL_ERK",
+        )
+        assert (ev.channels[1].power, ev.channels[1].group) == (100, "TTL_ERK")
+
+    def test_stim_channel_keeps_power_with_per_frame_exposure(self):
+        # per-frame stim_exposure forces the stim rebuild path
+        seq = self._seq(stim_exposure=(123,))
+        stim_ev = next(e for e in seq if e.index["t"] == 1 and e.stim_channels)
+        ch = stim_ev.stim_channels[0]
+        assert type(ch).__name__ == "PowerChannel"
+        assert ch.power == 25 and ch.group == "TTL_ERK" and ch.exposure == 123
 
     def test_ref_phase_timepoints_offset(self):
         """Ref phase timepoints are offset after the main experiment."""

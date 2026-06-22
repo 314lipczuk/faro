@@ -43,15 +43,31 @@ class CellposeV4(Segmentator):
         self._eval_lock = threading.Lock()
 
     def segment(self, image: np.ndarray) -> np.ndarray:
+        # ``image`` is either a single 2D channel (Y, X) or a multi-channel
+        # stack (C, Y, X) when SegmentationMethod.use_channel is a list.
         if self.gamma != 1.0:
+            # Gamma is applied to the raw counts of every channel before
+            # Cellpose normalizes. Cellpose's default normalize=True rescales
+            # the 1st-99th percentile to [0, 1] *per channel* (models.py
+            # docstring), and that rescale is linear, so x**gamma followed by
+            # per-channel percentile normalization is scale-invariant per
+            # channel: a brighter channel and a dimmer channel get the same
+            # contrast curve. So a single gamma is correct across channels.
             image = image**self.gamma
 
+        # For a (C, Y, X) stack tell Cellpose the channel axis so it
+        # normalizes each channel independently and packs them as the model's
+        # input channels (Cellpose-SAM is channel-order invariant and uses the
+        # first 3, zero-filling the rest). A 2D image needs no channel_axis.
+        eval_kwargs = dict(
+            flow_threshold=self.flow_threshold,
+            cellprob_threshold=self.cellprob_threshold,
+        )
+        if image.ndim == 3:
+            eval_kwargs["channel_axis"] = 0
+
         with self._eval_lock:
-            masks, flows, styles = self.model.eval(
-                image,
-                flow_threshold=self.flow_threshold,
-                cellprob_threshold=self.cellprob_threshold,
-            )
+            masks, flows, styles = self.model.eval(image, **eval_kwargs)
 
         if self.min_size > 0:
             # remove cells below threshold

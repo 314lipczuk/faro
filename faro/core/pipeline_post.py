@@ -372,6 +372,8 @@ class ImageProcessingPipeline_postExperiment:
                         )
             else:
                 for seg in self.segmentators:
+                    # use_channel is an int -> 2D (Y, X), or a list -> (C, Y, X)
+                    # via numpy fancy indexing (multi-channel, CellposeV4 only).
                     segmentation_results[seg.name] = seg.segmentation_class.segment(
                         img[seg.use_channel, :, :]
                     )

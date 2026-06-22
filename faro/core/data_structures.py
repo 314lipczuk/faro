@@ -283,7 +283,12 @@ class FovState:
 class SegmentationMethod:
     name: str
     segmentation_class: Segmentator
-    use_channel: int = 0
+    # Channel(s) of the (C, Y, X) frame to segment. An int selects a single
+    # channel and yields a 2D (Y, X) image; a list selects several and yields
+    # a (len, Y, X) stack (e.g. ``[0, 1]`` for membrane + nuclear). Only
+    # ``CellposeV4`` currently accepts a multi-channel stack; the other
+    # segmentators expect a single 2D channel.
+    use_channel: int | list[int] = 0
     save_tracked: bool = False
 
 

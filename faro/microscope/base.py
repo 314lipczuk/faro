@@ -115,8 +115,8 @@ class AbstractMicroscope:
     # ------------------------------------------------------------------
 
     def calibrate_dmd(self, calibration_channel):
-        "Calibrate the DMD if it is not already calibrated." ""
-        if isinstance(self.dmd, DMD) and self.dmd.affine is None:
+        """Calibrate the DMD. Always runs the calibration when called."""
+        if isinstance(self.dmd, DMD):
             self.dmd.calibrate(calibration_channel)
 
     def post_experiment(self):

@@ -87,8 +87,8 @@ class Niesen(PyMMCoreMicroscope):
         marker_style="x",
         calibration_points_DMD=None,
     ):
-        "Calibrate the DMD if it is not already calibrated." ""
-        if self.dmd is not None and self.dmd.affine is None:
+        """Calibrate the DMD. Always runs the calibration when called."""
+        if self.dmd is not None:
             self.dmd.calibrate(
                 calibration_channel,
                 verbose=verbose,

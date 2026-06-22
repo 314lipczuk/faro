@@ -188,7 +188,8 @@ class Moench(PyMMCoreMicroscope):
         calibration_points_DMD=None,
         background=True,
     ):
-        """Calibrate the DMD against the camera (if not already calibrated).
+        """Calibrate the DMD against the camera. Always runs when called
+        (re-call to retune, e.g. with a different channel or power).
 
         Args:
             calibration_channel: the light path (Channel/PowerChannel) to image
@@ -208,7 +209,7 @@ class Moench(PyMMCoreMicroscope):
         """
         self.disable_log_output()
 
-        if self.dmd is None or self.dmd.affine is not None:
+        if self.dmd is None:
             return
 
         def _do_calibration() -> None:

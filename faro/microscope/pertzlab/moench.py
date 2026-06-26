@@ -184,7 +184,7 @@ class Moench(PyMMCoreMicroscope):
     # default False = log loudly and continue.
     FILTER_VERIFY_RAISE_ON_FAILURE = False
 
-    def __init__(self, affine_calibration_matrix=None):
+    def __init__(self, affine_calibration_matrix=None, uncropped=False):
         super().__init__()
 
         pymmcore_plus.use_micromanager(self.MICROMANAGER_PATH)
@@ -196,6 +196,8 @@ class Moench(PyMMCoreMicroscope):
         self.affine_calibration_matrix = affine_calibration_matrix
         self.wakeup_dmd = None
         self.dmd_needs_to_be_waken = self.DMD_NEEDS_TO_BE_WAKEN
+        if uncropped:
+            self.SET_ROI_REQUIRED = False
         self.init_scope()
 
     def init_scope(self):

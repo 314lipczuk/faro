@@ -171,3 +171,173 @@ class TestSkipWaitDevices:
         # Without SKIP_WAIT_DEVICES, Mosaic3 is waited on as before.
         assert "Mosaic3" in mmc.wait_calls
         assert "Camera" in mmc.wait_calls
+
+
+# ===================================================================
+# Filter-turret verify / force-move (NikonTI "Already at position" bug)
+# ===================================================================
+
+class _Setting:
+    def __init__(self, dev, prop, val):
+        self._dev, self._prop, self._val = dev, prop, val
+
+    def getDeviceLabel(self):
+        return self._dev
+
+    def getPropertyName(self):
+        return self._prop
+
+    def getPropertyValue(self):
+        return self._val
+
+
+class _Config:
+    def __init__(self, settings):
+        self._s = settings
+
+    def size(self):
+        return len(self._s)
+
+    def getSetting(self, i):
+        return self._s[i]
+
+
+class _FakeFilterMMC:
+    """Minimal mmcore surface for ``_verify_filter_block``.
+
+    ``getState`` returns a *scripted* sequence so the test controls exactly
+    what the read-back sees (decoupled from set* calls), which is what lets us
+    assert the engine's control flow precisely.
+    """
+
+    DEVICE = "TIFilterBlock1"
+    TARGET_LABEL = "cube_T"
+    TARGET_STATE = 2
+    N_STATES = 6
+
+    def __init__(self, read_states, *, loaded=True, config_has_filter=True):
+        self._reads = list(read_states)
+        self._stuck = self._reads[-1] if self._reads else 0
+        self._loaded = [self.DEVICE] if loaded else ["Camera"]
+        self._config_has_filter = config_has_filter
+        self.setState_calls: list[int] = []
+        self.setStateLabel_calls: list[str] = []
+        self.getState_calls = 0
+
+    def getLoadedDevices(self):
+        return self._loaded
+
+    def getConfigData(self, group, config):
+        settings = [_Setting("Wheel-A", "Label", "x")]
+        if self._config_has_filter:
+            settings.append(_Setting(self.DEVICE, "Label", self.TARGET_LABEL))
+        return _Config(settings)
+
+    def getStateFromLabel(self, device, label):
+        assert label == self.TARGET_LABEL
+        return self.TARGET_STATE
+
+    def getNumberOfStates(self, device):
+        return self.N_STATES
+
+    def waitForDevice(self, device):
+        pass
+
+    def getState(self, device):
+        self.getState_calls += 1
+        return self._reads.pop(0) if self._reads else self._stuck
+
+    def setState(self, device, n):
+        self.setState_calls.append(n)
+
+    def setStateLabel(self, device, label):
+        self.setStateLabel_calls.append(label)
+
+
+class _FilterMic:
+    FILTER_VERIFY_DEVICE = "TIFilterBlock1"
+    FILTER_VERIFY_PROPERTY = "Label"
+    FILTER_VERIFY_MAX_CORRECTIONS = 3
+    FILTER_VERIFY_RAISE_ON_FAILURE = False
+
+
+class TestFilterBlockVerify:
+    """MoenchMDAEngine confirms the cube turret landed and force-moves on a miss.
+
+    Guards the silent "Already at position; not moving" skip in the closed
+    NikonTI adapter (see ``nikonti-re/FINDINGS.md``).
+    """
+
+    def _make_engine(self, mmc, mic):
+        import weakref
+
+        from faro.microscope.pertzlab.moench import MoenchMDAEngine
+
+        engine = MoenchMDAEngine.__new__(MoenchMDAEngine)
+        engine._mmcore_ref = weakref.ref(mmc)
+        engine._microscope_ref = weakref.ref(mic)
+        return engine
+
+    def test_fast_path_no_extra_move(self):
+        # Turret already reads the target -> no rotation, no correction.
+        mmc = _FakeFilterMMC(read_states=[_FakeFilterMMC.TARGET_STATE])
+        mic = _FilterMic()  # keep a strong ref; engine holds it weakly
+        engine = self._make_engine(mmc, mic)
+
+        engine._verify_filter_block("TTL_ERK", "mScarlet3")
+
+        assert mmc.setState_calls == []
+        assert mmc.setStateLabel_calls == []
+
+    def test_recovers_on_detected_mismatch(self):
+        # First read wrong (suppressed move), recovers after one force-move.
+        mmc = _FakeFilterMMC(read_states=[0, _FakeFilterMMC.TARGET_STATE])
+        mic = _FilterMic()  # keep a strong ref; engine holds it weakly
+        engine = self._make_engine(mmc, mic)
+
+        engine._verify_filter_block("TTL_ERK", "mScarlet3")
+
+        # neighbour = (2 + 1) % 6 = 3, then the real target label.
+        assert mmc.setState_calls == [3]
+        assert mmc.setStateLabel_calls == ["cube_T"]
+
+    def test_persistent_failure_logs_but_does_not_raise(self):
+        # Always wrong: exhaust corrections, log loudly, do not raise (default).
+        mmc = _FakeFilterMMC(read_states=[0])  # stuck at 0 forever
+        mic = _FilterMic()  # keep a strong ref; engine holds it weakly
+        engine = self._make_engine(mmc, mic)
+
+        engine._verify_filter_block("TTL_ERK", "mScarlet3")
+
+        assert len(mmc.setStateLabel_calls) == 3  # MAX_CORRECTIONS attempts
+        assert mmc.setState_calls == [3, 3, 3]
+
+    def test_persistent_failure_raises_when_flagged(self):
+        mmc = _FakeFilterMMC(read_states=[0])
+        mic = _FilterMic()
+        mic.FILTER_VERIFY_RAISE_ON_FAILURE = True
+        engine = self._make_engine(mmc, mic)
+
+        with pytest.raises(RuntimeError, match="WRONG cube"):
+            engine._verify_filter_block("TTL_ERK", "mScarlet3")
+
+    def test_channel_without_turret_is_noop(self):
+        # A channel whose preset doesn't drive the turret is left alone.
+        mmc = _FakeFilterMMC(read_states=[0], config_has_filter=False)
+        mic = _FilterMic()  # keep a strong ref; engine holds it weakly
+        engine = self._make_engine(mmc, mic)
+
+        engine._verify_filter_block("Binning", "2x2")
+
+        assert mmc.getState_calls == 0
+        assert mmc.setStateLabel_calls == []
+
+    def test_device_not_loaded_is_noop(self):
+        mmc = _FakeFilterMMC(read_states=[0], loaded=False)
+        mic = _FilterMic()  # keep a strong ref; engine holds it weakly
+        engine = self._make_engine(mmc, mic)
+
+        engine._verify_filter_block("TTL_ERK", "mScarlet3")
+
+        assert mmc.getState_calls == 0
+        assert mmc.setStateLabel_calls == []

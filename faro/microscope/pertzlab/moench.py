@@ -103,6 +103,29 @@ class Moench(PyMMCoreMicroscope):
     USE_ONLY_PFS = True
     DMD_NEEDS_TO_BE_WAKEN = True
     DMD_CHANNEL_GROUP = "TTL_ERK"
+
+    # --- Mosaic3 DMD hold / settle (see nikonti-re/mosaic3/FINDINGS.md) ---
+    # The Mosaic3 "SLM exposure" is the Andor ``ExposureTime`` feature: after a
+    # ``displaySLMImage`` ("Expose") the micromirrors hold the displayed pattern
+    # for exactly that long and then *park*. The Mosaic3 has no indefinite
+    # "Mirror On" hold mode, so to keep the pattern on the mirrors for a whole
+    # frame we set a long software exposure that outlasts any camera/LED window.
+    # Light is gated in *time* by the camera-triggered LED (light path
+    # LED -> DMD -> sample), not by the DMD, so holding the pattern between
+    # frames delivers no extra dose and the stim dose is unchanged. Without this
+    # a stale short ``ExposureTime`` left by another path (KeepDMDAlive.stop()
+    # -> 100 ms, calibration -> 25 ms) parks the mirrors mid-frame and the tail
+    # of any longer frame comes back dark -- the ">200 ms not displayed" symptom.
+    #
+    # ``DMD_HOLD_EXPOSURE_MS`` is forced onto the SLM for every displayed pattern
+    # (stim mask or all-on) by ``MoenchMDAEngine._set_event_slm_image``.
+    # 200000 ms = 200 s is the Mosaic3 datasheet max and matches
+    # ``DMD.display_livemode``. Set to None/0 to disable the override.
+    DMD_HOLD_EXPOSURE_MS: float = 200000.0
+    # Pause between committing the pattern (displaySLMImage / "Expose") and
+    # snapping, so the mirror commit settles before the camera opens and the
+    # camera-triggered LED fires. None/0 disables the wait.
+    DMD_SETTLE_MS: float = 50.0
     # Manual config->(device, property) power mappings. These must be declared
     # explicitly: this config selects LED lines via numeric NIDAQ TTL states
     # (the preset stores e.g. State "16"; the color "GreenYellow" only lives in
@@ -120,7 +143,10 @@ class Moench(PyMMCoreMicroscope):
         "CyanStim": ("LED", "Cyan_Level"),   # state 4  (pre-existing, known good)
         "mScarlet3": ("LED", "Green_Level"),  # state 16, confirmed on scope 2026-06-22
         "miRFP": ("LED", "Red_Level"),        # state 32, inferred from cfg labels
-        "mCitrine": ("LED", "Teal_Level"),    # state 8,  inferred from cfg labels
+        "mCitrine": ("LED", "Teal_Level"),
+        "mRuby2": ("LED", "Green_Level"),
+        "mTurquoise": ("LED", "Blue_Level"),
+        "mNeongreen": ("LED", "Cyan_Level")      # state 8,  inferred from cfg labels
     }
     BINNING = "2x2"
     # ROI applied as-is after binning — no centering recomputation.
@@ -137,6 +163,26 @@ class Moench(PyMMCoreMicroscope):
     # commits the pattern synchronously before we reach the wait, so
     # skipping the poll is safe. See TODO.md #1.
     SKIP_WAIT_DEVICES: tuple[str, ...] = ("Mosaic3",)
+
+    # --- Nikon Ti filter-turret reliability (see nikonti-re/FINDINGS.md) ---
+    # The closed NikonTI adapter decides whether to move the cube turret by
+    # comparing the requested position against an internal, callback-maintained
+    # position cache, and *silently skips the move* when they're equal
+    # ("Already at position; not moving" -- no error). A missed/mis-filtered
+    # position callback (worse under MM api75's reworked callback path) desyncs
+    # that cache, so a genuinely-needed cube change can be dropped with no
+    # exception and the frame is acquired through the WRONG cube.
+    #
+    # MoenchMDAEngine verifies the turret actually reached the commanded cube
+    # after a channel change and, on a detected mismatch, forces a real move.
+    # The success path is a single fast read (no extra rotation); the extra
+    # physical move fires only on a detected miss -- safe for ~15 s cadence.
+    FILTER_VERIFY_DEVICE: str | None = "TIFilterBlock1"
+    FILTER_VERIFY_PROPERTY = "Label"
+    FILTER_VERIFY_MAX_CORRECTIONS = 3
+    # If True, raise (aborting the run) when the turret can't be corrected;
+    # default False = log loudly and continue.
+    FILTER_VERIFY_RAISE_ON_FAILURE = False
 
     def __init__(self, affine_calibration_matrix=None):
         super().__init__()
@@ -379,6 +425,7 @@ class MoenchMDAEngine(MDAEngine):
         #     ...
         if (ch.group, ch.config) != self.mmcore._last_config:  # noqa: SLF001
             # Try multiple times to set the configuration in case of transient failures.
+            set_ok = False
             for attempt in range(1, max_retry_attempts + 1):
                 try:
                     self.mmcore.setConfig(ch.group, ch.config)
@@ -403,7 +450,131 @@ class MoenchMDAEngine(MDAEngine):
                     else:
                         time.sleep(0.1)
                 else:
+                    set_ok = True
                     break
+
+            # The NikonTI adapter can silently skip the filter-turret move when
+            # its internal position cache already (wrongly) equals the target.
+            # Confirm the cube actually changed and force a real move if not.
+            if set_ok:
+                self._verify_filter_block(ch.group, ch.config)
+
+    def _verify_filter_block(self, group: str, config: str) -> None:
+        """Confirm the Nikon Ti cube turret reached the cube this channel asks
+        for; on a detected mismatch, force a physical move and re-check.
+
+        Why: the closed NikonTI adapter decides whether to move the turret by
+        comparing the requested position against an internal, callback-fed
+        position cache, and silently skips the move when they're equal
+        ("Already at position; not moving" -- no exception, no error log). A
+        missed/mis-filtered position callback desyncs that cache, so a needed
+        cube change can be dropped and the frame acquired through the wrong
+        cube. Unlike XY/Z, the filter block has no independent re-read or
+        safety timeout in the adapter -- we add one here. See
+        ``nikonti-re/FINDINGS.md`` for the disassembly this is based on.
+
+        Strategy (cheap by default; an extra rotation only on a miss):
+          1. read the turret back; if it equals the target, return (the common
+             case -- one fast read, no extra movement);
+          2. on mismatch, force a real move by first going to a *neighbour*
+             position (which breaks the ``target == cache`` equality the
+             adapter uses to suppress the move) and then to the target,
+             re-checking each time;
+          3. if it still won't land, log loudly (and optionally raise) so a
+             long run surfaces the failure instead of silently collecting
+             wrong-cube data.
+
+        Detection note: the read-back goes through the same cache the adapter
+        compares against, so it cannot catch the rarer case where the cache
+        *wrongly* equals the target. Forcing the move unconditionally would,
+        but at the cost of doubling turret wear on every change -- not
+        acceptable at this rig's ~15 s cadence. If misses persist, the robust
+        fix is a direct-COM Ti backend (see ``nikonti-re/HANDOFF.md``).
+        """
+        mic = self.microscope
+        device = getattr(mic, "FILTER_VERIFY_DEVICE", None) if mic is not None else None
+        if not device:
+            return
+        prop = getattr(mic, "FILTER_VERIFY_PROPERTY", "Label")
+        max_corrections = int(getattr(mic, "FILTER_VERIFY_MAX_CORRECTIONS", 3))
+        core = self.mmcore
+
+        failed_target = None  # set to the label we couldn't reach
+        failed_state = None
+        try:
+            if device not in core.getLoadedDevices():
+                return
+
+            # Target cube for this channel, as set by the preset.
+            target_label = None
+            cfg = core.getConfigData(group, config)
+            for i in range(cfg.size()):
+                s = cfg.getSetting(i)
+                if s.getDeviceLabel() == device and s.getPropertyName() == prop:
+                    target_label = s.getPropertyValue()
+                    break
+            if target_label is None:
+                return  # this channel doesn't drive the turret
+
+            target_state = core.getStateFromLabel(device, target_label)
+            n_states = core.getNumberOfStates(device)
+
+            def _settled_state():
+                # waitForDevice respects the configured FilterBlock Delay; on
+                # this scope its Busy() is usable (not in SKIP_WAIT_DEVICES).
+                try:
+                    core.waitForDevice(device)
+                except RuntimeError:
+                    pass
+                return core.getState(device)
+
+            if _settled_state() == target_state:
+                return  # fast path: turret is where we asked, no extra movement
+
+            neighbour = (target_state + 1) % n_states
+            if neighbour != target_state:  # guard a 1-position device
+                for attempt in range(1, max_corrections + 1):
+                    logger.warning(
+                        "Filter turret missed %r (state %d); forcing move "
+                        "(%d/%d).",
+                        target_label, target_state, attempt, max_corrections,
+                    )
+                    print(
+                        f"[WARN] Filter turret missed {target_label!r}; "
+                        f"forcing move ({attempt}/{max_corrections})."
+                    )
+                    # Go to a different cube first so target != cached position;
+                    # this defeats the adapter's "Already at position" skip.
+                    core.setState(device, neighbour)
+                    try:
+                        core.waitForDevice(device)
+                    except RuntimeError:
+                        pass
+                    core.setStateLabel(device, target_label)
+                    if _settled_state() == target_state:
+                        logger.info(
+                            "Filter turret recovered to %r after %d attempt(s).",
+                            target_label, attempt,
+                        )
+                        return
+
+            failed_target = target_label
+            failed_state = _settled_state()
+        except Exception as e:  # never let verification crash an acquisition
+            logger.warning("Filter-turret verify errored (ignored). %s", e)
+            return
+
+        # Persistent mismatch: surface loudly so a long run can't silently
+        # collect wrong-cube data.
+        msg = (
+            f"Filter turret FAILED to reach {failed_target!r} after "
+            f"{max_corrections} forced moves (stuck at state {failed_state}); "
+            f"frames may be acquired through the WRONG cube."
+        )
+        logger.error(msg)
+        print(f"[ERROR] {msg}")
+        if getattr(mic, "FILTER_VERIFY_RAISE_ON_FAILURE", False):
+            raise RuntimeError(msg)
 
     def _set_event_xy_position(self, event: MDAEvent, max_retry_attempts=5) -> None:
         event_x, event_y = event.x_pos, event.y_pos
@@ -605,6 +776,51 @@ class MoenchMDAEngine(MDAEngine):
                 )
             }
         )
+
+    def _set_event_slm_image(self, event: MDAEvent) -> None:
+        """Upload the SLM pattern, then force a long *hold* exposure on the DMD.
+
+        The base method uploads the image and, if the ``SLMImage`` carries an
+        exposure, writes it via ``setSLMExposure``. On the Mosaic3 that value is
+        the Andor ``ExposureTime``: the micromirrors hold the displayed pattern
+        for exactly that long after the "Expose" and then park. We override it
+        to ``Moench.DMD_HOLD_EXPOSURE_MS`` so the mirrors stay in the pattern
+        across the whole camera/LED window (the Mosaic3 has no "Mirror On"
+        mode). The stim *dose* is unaffected -- it is gated by the
+        camera-triggered LED, not the DMD. See ``nikonti-re/mosaic3/FINDINGS.md``.
+        """
+        super()._set_event_slm_image(event)
+        if event.slm_image is None:
+            return
+        mic = self.microscope
+        hold_ms = (
+            getattr(mic, "DMD_HOLD_EXPOSURE_MS", None) if mic is not None else None
+        )
+        if not hold_ms:
+            return
+        core = self.mmcore
+        slm_device = event.slm_image.device or core.getSLMDevice()
+        if not slm_device:
+            return
+        try:
+            core.setSLMExposure(slm_device, float(hold_ms))
+        except Exception as e:
+            logger.warning("Failed to set DMD hold exposure. %s", e)
+
+    def _exec_event_slm_image(self, img) -> None:
+        """Display the pattern, then settle before the camera snaps.
+
+        ``displaySLMImage`` ("Expose") commits the mask to the micromirrors; the
+        short settle lets that commit finish before ``snapImage`` opens the
+        camera and the camera-triggered LED fires, so the first part of the
+        frame isn't integrated against a not-yet-committed pattern. Gated by
+        ``Moench.DMD_SETTLE_MS`` (None/0 disables). See FINDINGS.md.
+        """
+        super()._exec_event_slm_image(img)
+        mic = self.microscope
+        settle_ms = getattr(mic, "DMD_SETTLE_MS", None) if mic is not None else None
+        if settle_ms:
+            time.sleep(float(settle_ms) / 1000.0)
 
     def setup_single_event(self, event: MDAEvent) -> None:
         """Setup hardware for a single (non-sequenced) event.

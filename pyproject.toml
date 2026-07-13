@@ -36,7 +36,9 @@ test = [
 ]
 
 motile = [
-    "motile",
+    # motile 1.0 renamed every cost class (EdgeDistance -> EdgeDistanceCost,
+    # Appear -> NodeAppearCost, ...). motile_tracker.py targets the 0.x names.
+    "motile<1.0",
 ]
 
 stardist = [

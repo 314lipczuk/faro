@@ -200,9 +200,9 @@ def run_and_wait(
     ctrl: Controller, events: list[RTMEvent], stim_mode: str = "current"
 ) -> None:
     """Run an experiment and block until the analyzer idles. Then shut down."""
-    ctrl.run_experiment(events, stim_mode=stim_mode, validate=False)
-    ctrl._analyzer.wait_idle()
-    ctrl._analyzer.shutdown(wait=True)
+    handle = ctrl.run_experiment(events, stim_mode=stim_mode, validate=False)
+    handle.wait()
+    ctrl.finish_experiment()
 
 
 def run_and_wait_long(
@@ -212,6 +212,6 @@ def run_and_wait_long(
     timeout: float = 120,
 ) -> None:
     """Like :func:`run_and_wait` with a longer drain timeout for slow pipelines."""
-    ctrl.run_experiment(events, stim_mode=stim_mode, validate=False)
-    ctrl._analyzer.wait_idle(timeout=timeout)
-    ctrl._analyzer.shutdown(wait=True)
+    handle = ctrl.run_experiment(events, stim_mode=stim_mode, validate=False)
+    handle.wait()
+    ctrl.finish_experiment(drain_timeout=timeout)

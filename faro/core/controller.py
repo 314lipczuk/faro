@@ -1383,14 +1383,28 @@ class Controller:
                     resolve_power=self._mic.resolve_power,
                     suppress_stim=suppress_stim,
                 )
-                slm = None
+                # A stim event may expand into K DMD sub-frames (the staircase
+                # of per-cell doses); a single-mask stimulator yields exactly
+                # one. Build once per rtm_event and reuse across stim channels
+                # so Analyzer.get_stim_mask is polled only once.
+                stim_subframes = None
                 for ev in planned:
-                    if ev.metadata.get("img_type") == ImgType.IMG_STIM:
-                        if slm is None and self._mic.dmd:
-                            slm = self._build_stim_slm(rtm_event, stim_mode=stim_mode)
-                        if slm is not None:
-                            ev = ev.model_copy(update={"slm_image": slm})
-                    self._put_event(ev)
+                    if (
+                        ev.metadata.get("img_type") == ImgType.IMG_STIM
+                        and self._mic.dmd
+                    ):
+                        if stim_subframes is None:
+                            stim_subframes = self._build_stim_subframes(
+                                rtm_event, stim_mode=stim_mode
+                            )
+                        n_sub = len(stim_subframes)
+                        for i, (slm, duration) in enumerate(stim_subframes):
+                            self._put_event(
+                                self._expand_stim_event(ev, slm, duration, i, n_sub)
+                            )
+                        # An empty list => nothing to stimulate this frame.
+                    else:
+                        self._put_event(ev)
         finally:
             self._event_queue = None
             self._queue.put(self.STOP_EVENT)
@@ -1591,6 +1605,72 @@ class Controller:
         return SLMImage(
             data=stim_mask, device=self._mic.dmd.name, exposure=stim_ch.exposure
         )
+
+    def _build_stim_subframes(
+        self, rtm_event, *, stim_mode: str = "current"
+    ) -> list[tuple[SLMImage, float | None]]:
+        """Build the DMD sub-frame(s) to fire for one stim event.
+
+        Fetches the stim payload from the Analyzer once. A *list* payload is a
+        per-cell staircase — ``[(camera-space mask, duration_ms), ...]`` — and
+        maps to one ``SLMImage`` per step (each illuminated for its own
+        duration). A single ``ndarray``/sentinel payload (any legacy
+        stimulator) maps to exactly one sub-frame at the stim channel's
+        exposure, reproducing the previous behaviour.
+        """
+        fov_index = rtm_event.index.get("p", 0)
+        stim_ch = rtm_event.stim_channels[0]
+        dmd = self._mic.dmd
+
+        t = rtm_event.index.get("t", 0)
+        if stim_mode == "previous":
+            t -= 1
+            assert t >= 0, "previous-mode t=0 stim event reached _build_stim_subframes"
+        meta = {**rtm_event.metadata, "fov": fov_index, "timestep": t}
+
+        payload = self._analyzer.get_stim_mask(fov_index, meta)
+
+        # Staircase payload: one SLMImage per (mask, duration_ms) step.
+        if isinstance(payload, list):
+            subframes: list[tuple[SLMImage, float | None]] = []
+            for mask, duration in payload:
+                data = dmd.affine_transform(mask) if isinstance(mask, np.ndarray) else mask
+                slm = SLMImage(data=data, device=dmd.name, exposure=float(duration))
+                subframes.append((slm, float(duration)))
+            return subframes
+
+        # Legacy single-mask path (mask ndarray, bool sentinel, or unavailable).
+        if payload is None:
+            print("Warning: Stimulation mask unavailable, sending False to SLM.")
+            data = False
+        elif isinstance(payload, np.ndarray):
+            data = dmd.affine_transform(payload)
+        else:
+            data = payload
+        slm = SLMImage(data=data, device=dmd.name, exposure=stim_ch.exposure)
+        return [(slm, stim_ch.exposure)]
+
+    def _expand_stim_event(
+        self, ev: MDAEvent, slm: SLMImage, duration, index: int, n: int
+    ) -> MDAEvent:
+        """Attach a sub-frame's SLM image (and dose time) to a stim event copy.
+
+        For a single sub-frame (``n == 1``) the event keeps its original
+        ``fname`` so storage is unchanged. For a staircase (``n > 1``) each step
+        gets a distinct ``fname`` (``..._s{index}``) so the K stim snaps don't
+        overwrite each other, plus sub-frame bookkeeping in metadata.
+        """
+        update: dict = {"slm_image": slm}
+        if duration is not None:
+            update["exposure"] = float(duration)
+        if n > 1:
+            base_meta = dict(ev.metadata or {})
+            meta = {**base_meta, "stim_subframe": index, "n_stim_subframes": n}
+            base_fname = base_meta.get("fname")
+            if base_fname is not None:
+                meta["fname"] = f"{base_fname}_s{index}"
+            update["metadata"] = meta
+        return ev.model_copy(update=update)
 
     def _put_event(self, event: MDAEvent) -> None:
         """Queue an MDA event."""

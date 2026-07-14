@@ -110,6 +110,20 @@ def dispatch_stim_mask(
     return stim_mask
 
 
+def _combine_stim_subframes(subframes, shape):
+    """Reduce a staircase payload ``[(mask, duration_ms), ...]`` to one 2D mask.
+
+    Used only for storage/visualization of what fired: the union of the
+    sub-frame masks marks every cell that received any dose.
+    """
+    combined = np.zeros(shape, np.uint8)
+    for item in subframes:
+        mask = item[0] if isinstance(item, (tuple, list)) else item
+        if isinstance(mask, np.ndarray) and mask.shape == combined.shape:
+            combined = np.maximum(combined, mask.astype(np.uint8))
+    return combined
+
+
 def convert_track_dtypes(df):
     """Drop img_type column and cast standard columns to compact dtypes."""
     if not df.empty:
@@ -556,6 +570,10 @@ class ImageProcessingPipeline:
                     )
                 if fired is None:
                     fired = np.zeros(shape_img, np.uint8)
+                elif isinstance(fired, list):
+                    # Staircase payload: store the union of the sub-frame masks
+                    # (every cell that received any dose) as the fired mask.
+                    fired = _combine_stim_subframes(fired, shape_img)
                 store_img(fired, metadata, self.storage_path, "stim_mask", writer=w)
             else:
                 store_img(
